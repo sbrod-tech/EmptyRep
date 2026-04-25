@@ -132,7 +132,6 @@ async def chat_image(
             "emotion": "thinking"
         }
         
-
 @app.post("/api/chat/answer")
 async def chat_answer(
     name: str = Form(...),
