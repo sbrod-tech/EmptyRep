@@ -131,3 +131,55 @@ async def chat_image(
             "hint": str(e),
             "emotion": "thinking"
         }
+        
+
+@app.post("/api/chat/answer")
+async def chat_answer(
+    name: str = Form(...),
+    grade: str = Form(...),
+    user_answer: str = Form(...)
+):
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            response_format={"type": "json_object"},
+            messages=[
+                {
+                    "role": "system",
+                    "content": f"""
+Ты репетитор по математике для {grade} класса.
+
+ВАЖНО:
+- НЕ давай ответ сразу
+- оцени ответ ученика
+- если он близко → похвали
+- если ошибка → мягко направь
+- задай следующий вопрос
+
+Ответ строго JSON:
+{{
+  "reply": "...",
+  "question": "...",
+  "hint": "...",
+  "emotion": "thinking | encourage | success"
+}}
+"""
+                },
+                {
+                    "role": "user",
+                    "content": f"Ответ ученика: {user_answer}"
+                }
+            ],
+            max_tokens=300
+        )
+
+        import json
+        return json.loads(response.choices[0].message.content)
+
+    except Exception as e:
+        return {
+            "reply": "Давай попробуем ещё раз 🙂",
+            "question": "Подумай ещё немного",
+            "hint": str(e),
+            "emotion": "thinking"
+        }
