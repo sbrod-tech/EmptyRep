@@ -1,6 +1,7 @@
 import base64
 import os
 import json
+import re
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -22,97 +23,81 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 # ===== MEMORY =====
 chat_memory = {}
 
-# ===== SYSTEM PROMPT =====
-def get_system_prompt(grade):
-    return f"""
-Ты — Мурчик 🐾, внимательный и умный наставник по математике для {grade} класса.
+# ===== UTILS =====
 
-========================================
-🎯 ГЛАВНАЯ ЗАДАЧА
-========================================
-Научить ребёнка думать ПРАВИЛЬНО.
+def safe_eval(expr: str):
+    try:
+        expr = expr.replace(" ", "")
+        if not re.match(r'^[0-9+\-*/().]+$', expr):
+            return None
+        return eval(expr)
+    except:
+        return None
 
-========================================
-🚨 КРИТИЧЕСКИЕ ПРАВИЛА
-========================================
+def extract_number(text: str):
+    nums = re.findall(r'\d+', text)
+    return int(nums[-1]) if nums else None
 
-1. ВСЕГДА ПРОВЕРЯЙ ответ ученика
-- если ответ НЕВЕРНЫЙ → НЕ говори "отлично"
-- мягко укажи на ошибку
-- предложи подумать ещё
+# ===== ANALYZE PROBLEM =====
 
-2. НЕ ДУБЛИРУЙ СМЫСЛ
-- не повторяй один и тот же вопрос разными словами
-- один шаг = одна мысль
+def analyze_problem(text, grade):
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            response_format={"type": "json_object"},
+            messages=[
+                {
+                    "role": "system",
+                    "content": f"""
+Ты анализируешь задачу для {grade} класса.
 
-3. НЕ ПЕРЕГРУЖАЙ
-- максимум 1 вопрос
-- максимум 1 подсказка
+Верни JSON:
 
-========================================
-🧠 ЛОГИКА РАБОТЫ
-========================================
-
-Если ученик дал ответ:
-
-- сначала ПРОВЕРЬ его
-- если правильно → похвали и иди дальше
-- если нет → мягко направь
-
-Пример:
-❌ "Отлично!" (если ошибка)
-✅ "Давай проверим ещё раз 🐾"
-
-========================================
-🔢 РЕКОМПОЗИЦИЯ
-========================================
-
-Используй разложение, если:
-- числа до 10
-- или ученик ошибся
-
-Пример:
-3 = 1 + 1 + 1
-
-========================================
-📚 ОБЪЯСНЕНИЕ
-========================================
-
-- просто
-- коротко
-- понятно
-- уровень {grade} класса
-
-========================================
-🎯 ПОВЕДЕНИЕ
-========================================
-
-- дружелюбный 😊
-- поддерживающий
-- как учитель, а не чат
-
-========================================
-📦 ФОРМАТ ОТВЕТА
-========================================
-Ты ОБЯЗАН отвечать только в JSON формате.
-Ответ должен быть валидным json_object.
 {{
-  "reply": "короткий комментарий (проверка или поддержка)",
-  "question": "ОДИН следующий шаг",
-  "hint": "ОДНА подсказка",
-  "emotion": "happy | thinking | confused | proud | playful"
+  "type": "time | arithmetic | unknown",
+  "goal": "что нужно найти",
+  "steps": ["шаг 1", "шаг 2"]
 }}
 
-========================================
-🚫 ЗАПРЕЩЕНО
-========================================
+НЕ решай задачу.
+ОТВЕТ строго JSON.
+"""
+                },
+                {"role": "user", "content": text}
+            ]
+        )
 
-- говорить "отлично", если ошибка
-- задавать несколько одинаковых вопросов
-- давать 2-3 подсказки сразу
+        return json.loads(response.choices[0].message.content)
+    except:
+        return {"type": "unknown"}
+
+# ===== SYSTEM PROMPT =====
+
+def get_system_prompt(grade):
+    return f"""
+Ты — Мурчик 🐾, наставник по математике для {grade} класса.
+
+ВАЖНО:
+Ты должен отвечать только в JSON формате (json_object).
+
+ПРАВИЛА:
+- НЕ давай ответ сразу
+- веди по шагам
+- проверяй ответы ученика
+- если ошибка — мягко исправь
+- не дублируй вопросы
+
+ФОРМАТ:
+{{
+  "reply": "...",
+  "question": "...",
+  "hint": "...",
+  "emotion": "happy | thinking | confused | proud | playful"
+}}
 """
 
-# ===== MODELS =====
+# ===== MODEL =====
+
 class ChatMessageRequest(BaseModel):
     name: str
     grade: int
@@ -120,36 +105,62 @@ class ChatMessageRequest(BaseModel):
     user_id: str
 
 # ===== ROUTES =====
+
 @app.get("/")
 def root():
-    return {"message": "Murmatika backend is running 🐾"}
+    return {"message": "Murmatika API running 🐾"}
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-# ===== TEXT CHAT (С ПАМЯТЬЮ) =====
+# ===== MAIN CHAT =====
+
 @app.post("/api/chat/message")
 def chat_message(data: ChatMessageRequest):
     try:
         user_id = data.user_id
 
-        # создаём память если нет
+        # создаём память
         if user_id not in chat_memory:
             chat_memory[user_id] = []
 
-        # добавляем сообщение пользователя
+        # добавляем сообщение
         chat_memory[user_id].append({
             "role": "user",
             "content": data.message
         })
 
-        # ограничиваем историю (последние 10 сообщений)
-        history = chat_memory[user_id][-10:]
+        # ===== КОНТРОЛЬ ОТВЕТОВ =====
+        correct = safe_eval(data.message)
+        user_answer = extract_number(data.message)
+
+        if correct is not None and user_answer is not None:
+            if user_answer == correct:
+                return {
+                    "reply": "Отлично! Это правильный ответ 🎉",
+                    "question": "Хочешь решить ещё задачу?",
+                    "hint": "",
+                    "emotion": "proud"
+                }
+            else:
+                return {
+                    "reply": "Давай проверим ещё раз 🐾",
+                    "question": f"Сколько будет {data.message}?",
+                    "hint": "Попробуй сложить десятки и единицы отдельно",
+                    "emotion": "thinking"
+                }
+
+        # ===== АНАЛИЗ ЗАДАЧИ =====
+        analysis = analyze_problem(data.message, data.grade)
+
+        history = chat_memory[user_id][-6:]
 
         messages = [
-            {"role": "system", "content": get_system_prompt(data.grade)}
-        ] + history
+            {"role": "system", "content": get_system_prompt(data.grade)},
+            {"role": "system", "content": f"Анализ задачи: {analysis}"},
+            *history
+        ]
 
         response = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -160,13 +171,13 @@ def chat_message(data: ChatMessageRequest):
         content = response.choices[0].message.content
         parsed = json.loads(content)
 
-        # сохраняем ответ Мурчика
+        # сохраняем ответ
         chat_memory[user_id].append({
             "role": "assistant",
             "content": content
         })
 
-        # защита от переполнения памяти
+        # ограничиваем память
         if len(chat_memory[user_id]) > 20:
             chat_memory[user_id] = chat_memory[user_id][-20:]
 
@@ -181,6 +192,7 @@ def chat_message(data: ChatMessageRequest):
         }
 
 # ===== IMAGE CHAT =====
+
 @app.post("/api/chat/image")
 async def chat_image(
     name: str = Form(...),
@@ -192,18 +204,15 @@ async def chat_image(
     base64_image = base64.b64encode(contents).decode("utf-8")
 
     try:
-        history = chat_memory.get(user_id, [])[-6:]
-
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": get_system_prompt(grade)},
-                *history,
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": "Реши задачу с фото"},
+                        {"type": "text", "text": "Реши задачу"},
                         {
                             "type": "image_url",
                             "image_url": {
@@ -215,49 +224,12 @@ async def chat_image(
             ]
         )
 
-        content = response.choices[0].message.content
-        parsed = json.loads(content)
-
-        return parsed
+        return json.loads(response.choices[0].message.content)
 
     except Exception as e:
         return {
             "reply": "Мурчик не понял картинку 😿",
-            "question": "Попробуй сфотографировать ещё раз?",
+            "question": "Попробуй ещё раз?",
             "hint": str(e),
             "emotion": "confused"
-        }
-
-# ===== ANSWER CHECK =====
-@app.post("/api/chat/answer")
-async def chat_answer(
-    name: str = Form(...),
-    grade: int = Form(...),
-    user_id: str = Form(...),
-    user_answer: str = Form(...)
-):
-    try:
-        history = chat_memory.get(user_id, [])[-6:]
-
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": get_system_prompt(grade)},
-                *history,
-                {"role": "user", "content": f"Ответ ученика: {user_answer}"}
-            ]
-        )
-
-        content = response.choices[0].message.content
-        parsed = json.loads(content)
-
-        return parsed
-
-    except Exception as e:
-        return {
-            "reply": "Давай попробуем ещё 🐾",
-            "question": "Подумай внимательно",
-            "hint": str(e),
-            "emotion": "thinking"
         }
