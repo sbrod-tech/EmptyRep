@@ -24,6 +24,14 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 state_memory = {}
 
+# ================= MODELS =================
+
+class ChatMessageRequest(BaseModel):
+    name: str
+    grade: int
+    message: str
+    user_id: str
+
 # ================= UTILS =================
 
 def is_new_problem(text: str):
@@ -32,30 +40,48 @@ def is_new_problem(text: str):
         len(text) > 20 and
         any(w in t for w in [
             "сколько", "во сколько", "найди",
-            "пошел", "встретились", "вышел"
+            "пошел", "встретились", "скорость"
         ])
     )
 
-def extract_number(text: str):
-    nums = re.findall(r'\d+', text)
-    return int(nums[-1]) if nums else None
+def parse_user_answer(text: str):
+    t = text.lower().replace(",", ".").strip()
 
-def parse_expression(text: str):
-    match = re.search(r'(\d+)\s*([\+\-\*/])\s*(\d+)', text)
-    if not match:
-        return None
+    # время
+    m_time = re.search(r'(\d{1,2})[:.](\d{2})', t)
+    if m_time:
+        h, m = int(m_time.group(1)), int(m_time.group(2))
+        return {"type": "time", "value": h * 60 + m}
 
-    a, op, b = match.groups()
-    expr = f"{a}{op}{b}"
+    # число
+    m_num = re.search(r'(\d+(\.\d+)?)', t)
+    if m_num:
+        val = float(m_num.group(1))
+        return {"type": "number", "value": val}
 
+    return {"type": "unknown", "value": None}
+
+def is_close(a, b, tol=1e-6):
     try:
-        result = eval(expr)
+        return abs(float(a) - float(b)) <= tol
     except:
-        return None
+        return False
 
-    return expr, result
+def detect_error(user, correct):
+    if user["type"] == "unknown":
+        return "no_number"
 
-# ================= STEP GENERATION =================
+    if correct["type"] == "number":
+        if not is_close(user["value"], correct["value"]):
+            return "wrong_value"
+
+    if correct["type"] == "time":
+        if user["value"] != correct["value"]:
+            return "wrong_time"
+
+    return "ok"
+
+# ================= GPT STEP GENERATION =================
 
 def generate_steps(problem, grade):
     try:
@@ -66,21 +92,22 @@ def generate_steps(problem, grade):
                 {
                     "role": "system",
                     "content": f"""
-Разбей задачу для ученика {grade} класса на ЧЁТКИЕ шаги.
+Разбей задачу для {grade} класса на шаги.
 
-ПРАВИЛА:
-- каждый шаг = 1 вопрос
-- без решения
-- без лишнего текста
+ВАЖНО:
+- каждый шаг = вопрос
+- у каждого шага есть ответ
 
-Пример:
-[
- "Во сколько Ваня вышел?",
- "Сколько минут шел Коля?"
-]
+Формат:
 
-Ответ строго JSON:
-{{ "steps": ["...", "..."] }}
+{{
+  "steps": [
+    {{ "question": "...", "answer": 36 }},
+    {{ "question": "...", "answer": 5 }}
+  ]
+}}
+
+Ответ строго JSON
 """
                 },
                 {"role": "user", "content": problem}
@@ -90,14 +117,13 @@ def generate_steps(problem, grade):
         return json.loads(response.choices[0].message.content)["steps"]
 
     except Exception:
-        # fallback если GPT не ответил
-        return ["Попробуй понять условие задачи"]
+        return [
+            {"question": "Попробуй понять условие задачи", "answer": 0}
+        ]
 
-# ================= GPT FORMATTER =================
+# ================= GPT ERROR EXPLAIN =================
 
-def build_murchik(step, is_correct, grade):
-    status = "правильно" if is_correct else "ошибка"
-
+def explain_error(step, user_text, correct_value, error_type, grade):
     try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -106,26 +132,31 @@ def build_murchik(step, is_correct, grade):
                 {
                     "role": "system",
                     "content": f"""
-Ты Мурчик 🐾 — учитель начальных классов.
+Ты Мурчик 🐾 — учитель {grade} класса.
 
-Текущий шаг:
+Шаг:
 {step}
 
-Ответ ученика: {status}
+Ответ ученика:
+{user_text}
 
-Сформируй:
-- короткую реакцию (1 строка)
-- ОДИН вопрос
-- ОДНУ подсказку
+Правильный ответ:
+{correct_value}
 
-НЕ уходи от шага.
+Тип ошибки:
+{error_type}
 
-Ответ строго JSON:
+Сделай:
+- короткое объяснение (1 строка)
+- повтори вопрос
+- дай подсказку
+
+Строго JSON:
 {{
   "reply": "...",
   "question": "...",
   "hint": "...",
-  "emotion": "happy | thinking | confused | proud"
+  "emotion": "thinking"
 }}
 """
                 }
@@ -135,21 +166,12 @@ def build_murchik(step, is_correct, grade):
         return json.loads(response.choices[0].message.content)
 
     except Exception:
-        # fallback если GPT не ответил
         return {
-            "reply": "Давай подумаем вместе 🐾",
+            "reply": "Давай попробуем ещё раз 🐾",
             "question": step,
-            "hint": "",
+            "hint": "Подумай внимательно",
             "emotion": "thinking"
         }
-
-# ================= MODEL =================
-
-class ChatMessageRequest(BaseModel):
-    name: str
-    grade: int
-    message: str
-    user_id: str
 
 # ================= ROUTES =================
 
@@ -162,8 +184,7 @@ def chat(data: ChatMessageRequest):
     user_id = data.user_id
     text = data.message.strip()
 
-    # ================= NEW PROBLEM =================
-
+    # ===== NEW PROBLEM =====
     if user_id not in state_memory or is_new_problem(text):
 
         steps = generate_steps(text, data.grade)
@@ -171,48 +192,35 @@ def chat(data: ChatMessageRequest):
         state_memory[user_id] = {
             "problem": text,
             "steps": steps,
-            "current_step": 0,
-            "expected_answer": None
+            "current_step": 0
         }
 
         return {
             "reply": "Давай решим задачу вместе 🐾",
-            "question": steps[0],
+            "question": steps[0]["question"],
             "hint": "",
             "emotion": "thinking"
         }
 
-    # ================= CURRENT STATE =================
-
+    # ===== CURRENT STATE =====
     state = state_memory[user_id]
-    step_index = state["current_step"]
-    current_step = state["steps"][step_index]
+    step_data = state["steps"][state["current_step"]]
 
-    parsed_expr = parse_expression(text)
-    user_number = extract_number(text)
+    correct = {
+        "type": "number",
+        "value": step_data["answer"]
+    }
 
-    is_correct = None
+    user = parse_user_answer(text)
+    error_type = detect_error(user, correct)
 
-    # ================= USER INPUT = EXPRESSION =================
-
-    if parsed_expr:
-        expr, result = parsed_expr
-        state["expected_answer"] = result
-        is_correct = True
-
-    # ================= USER INPUT = NUMBER =================
-
-    elif user_number is not None and state["expected_answer"] is not None:
-        is_correct = (user_number == state["expected_answer"])
-
-    # ================= CORRECT =================
-
-    if is_correct is True:
+    # ===== CORRECT =====
+    if error_type == "ok":
         state["current_step"] += 1
 
         if state["current_step"] >= len(state["steps"]):
             return {
-                "reply": "Отлично! Мы решили задачу 🎉",
+                "reply": "Отлично! 🎉",
                 "question": "",
                 "hint": "",
                 "emotion": "proud"
@@ -220,18 +228,18 @@ def chat(data: ChatMessageRequest):
 
         next_step = state["steps"][state["current_step"]]
 
-        return build_murchik(next_step, True, data.grade)
+        return {
+            "reply": "Верно 👍",
+            "question": next_step["question"],
+            "hint": "",
+            "emotion": "happy"
+        }
 
-    # ================= WRONG =================
-
-    if is_correct is False:
-        return build_murchik(current_step, False, data.grade)
-
-    # ================= UNKNOWN =================
-
-    return {
-        "reply": "Давай подумаем вместе 🐾",
-        "question": current_step,
-        "hint": "Попробуй ответить числом",
-        "emotion": "thinking"
-    }
+    # ===== ERROR =====
+    return explain_error(
+        step=step_data["question"],
+        user_text=text,
+        correct_value=step_data["answer"],
+        error_type=error_type,
+        grade=data.grade
+    )
