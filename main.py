@@ -19,6 +19,9 @@ app.add_middleware(
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+# ===== MEMORY =====
+chat_memory = {}
+
 # ===== SYSTEM PROMPT =====
 def get_system_prompt(grade):
     return f"""
@@ -32,7 +35,7 @@ def get_system_prompt(grade):
 - будь дружелюбным
 - максимум 2-3 предложения
 
-ФОРМАТ JSON:
+ОТВЕЧАЙ СТРОГО В JSON:
 {{
   "reply": "...",
   "question": "...",
@@ -46,6 +49,7 @@ class ChatMessageRequest(BaseModel):
     name: str
     grade: int
     message: str
+    user_id: str
 
 # ===== ROUTES =====
 @app.get("/")
@@ -56,20 +60,49 @@ def root():
 def health():
     return {"status": "ok"}
 
-# ===== TEXT CHAT =====
+# ===== TEXT CHAT (С ПАМЯТЬЮ) =====
 @app.post("/api/chat/message")
 def chat_message(data: ChatMessageRequest):
     try:
+        user_id = data.user_id
+
+        # создаём память если нет
+        if user_id not in chat_memory:
+            chat_memory[user_id] = []
+
+        # добавляем сообщение пользователя
+        chat_memory[user_id].append({
+            "role": "user",
+            "content": data.message
+        })
+
+        # ограничиваем историю (последние 10 сообщений)
+        history = chat_memory[user_id][-10:]
+
+        messages = [
+            {"role": "system", "content": get_system_prompt(data.grade)}
+        ] + history
+
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": get_system_prompt(data.grade)},
-                {"role": "user", "content": data.message}
-            ]
+            messages=messages
         )
 
-        return json.loads(response.choices[0].message.content)
+        content = response.choices[0].message.content
+        parsed = json.loads(content)
+
+        # сохраняем ответ Мурчика
+        chat_memory[user_id].append({
+            "role": "assistant",
+            "content": content
+        })
+
+        # защита от переполнения памяти
+        if len(chat_memory[user_id]) > 20:
+            chat_memory[user_id] = chat_memory[user_id][-20:]
+
+        return parsed
 
     except Exception as e:
         return {
@@ -84,17 +117,21 @@ def chat_message(data: ChatMessageRequest):
 async def chat_image(
     name: str = Form(...),
     grade: int = Form(...),
+    user_id: str = Form(...),
     image: UploadFile = File(...)
 ):
     contents = await image.read()
     base64_image = base64.b64encode(contents).decode("utf-8")
 
     try:
+        history = chat_memory.get(user_id, [])[-6:]
+
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": get_system_prompt(grade)},
+                *history,
                 {
                     "role": "user",
                     "content": [
@@ -110,7 +147,10 @@ async def chat_image(
             ]
         )
 
-        return json.loads(response.choices[0].message.content)
+        content = response.choices[0].message.content
+        parsed = json.loads(content)
+
+        return parsed
 
     except Exception as e:
         return {
@@ -125,19 +165,26 @@ async def chat_image(
 async def chat_answer(
     name: str = Form(...),
     grade: int = Form(...),
+    user_id: str = Form(...),
     user_answer: str = Form(...)
 ):
     try:
+        history = chat_memory.get(user_id, [])[-6:]
+
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": get_system_prompt(grade)},
+                *history,
                 {"role": "user", "content": f"Ответ ученика: {user_answer}"}
             ]
         )
 
-        return json.loads(response.choices[0].message.content)
+        content = response.choices[0].message.content
+        parsed = json.loads(content)
+
+        return parsed
 
     except Exception as e:
         return {
