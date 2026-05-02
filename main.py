@@ -43,13 +43,10 @@ def root():
 def clean_text(text: str):
     text = text.replace('\r', '\n')
     text = re.sub(r'\n+', '\n', text)
-
-    # OCR мусор
     text = text.replace('•', ' ')
     text = text.replace('·', ' ')
     text = text.replace('|', ' ')
     text = text.replace('—', '-')
-
     return text.strip()
 
 # =========================
@@ -57,156 +54,177 @@ def clean_text(text: str):
 # =========================
 def split_tasks_smart(text: str):
     lines = [l.strip() for l in text.split('\n') if l.strip()]
-
     tasks = []
-    current_task = ""
+    current = ""
 
     starters = [
-        "найди", "определи", "запиши", "реши",
-        "вычисли", "сколько", "с какой",
-        "вырежи", "начерти"
+        "найди","определи","запиши","реши",
+        "вычисли","сколько","с какой",
+        "вырежи","начерти"
     ]
 
-    def is_new_task(line):
+    def is_new(line):
         if re.match(r'^\d{2,3}[\.\)]?\s', line):
             return True
-        lower = line.lower()
-        return any(lower.startswith(w) for w in starters)
+        return any(line.lower().startswith(w) for w in starters)
 
     for line in lines:
-        if is_new_task(line):
-            if current_task:
-                tasks.append(current_task.strip())
-            current_task = line
+        if is_new(line):
+            if current:
+                tasks.append(current.strip())
+            current = line
         else:
-            if current_task:
-                current_task += " " + line
+            if current:
+                current += " " + line
 
-    if current_task:
-        tasks.append(current_task.strip())
+    if current:
+        tasks.append(current.strip())
 
-    # фильтры
     tasks = [t for t in tasks if len(t) > 40]
     tasks = [t for t in tasks if re.search(r'[а-яА-Я]', t)]
 
     return tasks
 
 # =========================
-# 🔢 АНТИ-ФАНТАЗИЯ
+# 🔢 SIMPLE EXPRESSION
 # =========================
-def contains_new_numbers(task, steps):
-    task_numbers = set(re.findall(r'\d+', task))
-    steps_numbers = set(re.findall(r'\d+', json.dumps(steps)))
-    return not steps_numbers.issubset(task_numbers)
+def is_simple_expression(task: str):
+    return bool(re.match(r'^[\d\s\+\-\*/\(\)]+$', task.strip()))
+
+def generate_simple_steps(task: str):
+    task = task.replace(" ", "")
+
+    if "+" in task:
+        a, b = map(int, task.split("+"))
+
+        a10, a1 = a // 10 * 10, a % 10
+        b10, b1 = b // 10 * 10, b % 10
+
+        sum10 = a10 + b10
+        sum1 = a1 + b1
+        result = sum10 + sum1
+
+        return {
+            "steps": [
+                {"question": f"Разложим {a}. Сколько это?", "answer": f"{a10}+{a1}", "hint": "Раздели на десятки и единицы"},
+                {"question": f"Разложим {b}. Сколько это?", "answer": f"{b10}+{b1}", "hint": "То же самое"},
+                {"question": f"Сколько будет {a10} + {b10}?", "answer": str(sum10), "hint": "Складываем десятки"},
+                {"question": f"Сколько будет {a1} + {b1}?", "answer": str(sum1), "hint": "Складываем единицы"},
+                {"question": f"Сколько будет {sum10} + {sum1}?", "answer": str(result), "hint": "Финальный шаг"}
+            ]
+        }
+
+    if "-" in task:
+        a, b = map(int, task.split("-"))
+        return {
+            "steps": [
+                {"question": f"Сколько будет {task}?", "answer": str(a - b), "hint": "Попробуй вычесть"}
+            ]
+        }
+
+    return {
+        "steps": [
+            {"question": f"Сколько будет {task}?", "answer": "", "hint": ""}
+        ]
+    }
 
 # =========================
-# ❌ ПЛОХИЕ ШАГИ
+# 🧠 СНАЧАЛА РЕШАЕМ
 # =========================
-def is_bad_step(step):
-    q = step["question"].lower()
+def solve_task_first(task: str):
+    res = client.chat.completions.create(
+        model="gpt-4o",
+        response_format={"type": "json_object"},
+        messages=[{
+            "role": "user",
+            "content": f"""
+Реши задачу.
 
-    bad_patterns = [
-        "что такое",
-        "как думаешь",
-        "попробуй подумать",
-        "например"
-    ]
-
-    return any(p in q for p in bad_patterns)
-
-# =========================
-# 🧠 ПРОВЕРКА ЛОГИКИ
-# =========================
-def validate_steps(task: str, steps: list):
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            response_format={"type": "json_object"},
-            messages=[
-                {
-                    "role": "user",
-                    "content": f"""
-Ты проверяешь шаги решения задачи.
-
-ЗАДАЧА:
+Задача:
 {task}
 
-ШАГИ:
-{json.dumps(steps, ensure_ascii=False)}
-
-Проверь:
-- логика последовательная?
-- нет ли скачков?
-- каждый шаг — действие?
-
-Ответ:
-
-{{ "valid": true }}
-или
-{{ "valid": false, "reason": "коротко" }}
+Верни JSON:
+{{
+  "final_answer": "...",
+  "plan": ["шаг1","шаг2","шаг3"]
+}}
 """
-                }
-            ],
-        )
-
-        raw = response.choices[0].message.content
-        return json.loads(raw)
-
-    except Exception:
-        return {"valid": True}
+        }]
+    )
+    return json.loads(res.choices[0].message.content)
 
 # =========================
-# 🧠 ГЕНЕРАЦИЯ ШАГОВ (РЕПЕТИТОР)
+# 🧠 ШАГИ ПО ПЛАНУ
 # =========================
-def generate_steps(task: str):
-    response = client.chat.completions.create(
+def generate_steps_from_plan(task: str, solution: dict):
+    plan = solution.get("plan", [])
+
+    res = client.chat.completions.create(
         model="gpt-4o-mini",
         response_format={"type": "json_object"},
-        messages=[
-            {
-                "role": "user",
-                "content": f"""
-Ты лучший репетитор по математике для детей 1–5 класса.
+        messages=[{
+            "role": "user",
+            "content": f"""
+Ты репетитор.
 
-=========================
-ПРАВИЛА
-=========================
+ПЛАН:
+{plan}
 
-1. Каждый шаг = КОНКРЕТНОЕ действие
-2. Вопрос = простой и понятный
-3. НЕЛЬЗЯ:
-   - "что такое..."
-   - "как думаешь"
-   - "например"
-4. НЕ менять числа
-5. НЕ придумывать данные
+Сделай обучающие шаги.
 
-=========================
-ФОРМАТ
-=========================
+ПРАВИЛА:
+- каждый шаг = конкретное действие
+- простой язык
+- без фантазии
+- не менять числа
 
-{{
-  "steps": [
-    {{
-      "question": "...",
-      "answer": "...",
-      "hint": "..."
-    }}
-  ]
-}}
+Верни JSON steps.
 
-=========================
-ЗАДАЧА
-=========================
-
+Задача:
 {task}
 """
-            }
-        ],
+        }]
     )
 
-    raw = response.choices[0].message.content
-    return json.loads(raw)
+    return json.loads(res.choices[0].message.content)
+
+# =========================
+# 🔒 ПРОВЕРКИ
+# =========================
+def contains_new_numbers(task, steps):
+    task_nums = set(re.findall(r'\d+', task))
+    step_nums = set(re.findall(r'\d+', json.dumps(steps)))
+    return not step_nums.issubset(task_nums)
+
+def is_bad_step(step):
+    q = step["question"].lower()
+    bad = ["что такое", "как думаешь", "например"]
+    return any(b in q for b in bad)
+
+def validate_steps(task, steps):
+    try:
+        res = client.chat.completions.create(
+            model="gpt-4o-mini",
+            response_format={"type": "json_object"},
+            messages=[{
+                "role": "user",
+                "content": f"""
+Проверь шаги.
+
+Задача:
+{task}
+
+Шаги:
+{json.dumps(steps, ensure_ascii=False)}
+
+Ответ:
+{{ "valid": true }} или {{ "valid": false }}
+"""
+            }]
+        )
+        return json.loads(res.choices[0].message.content)
+    except:
+        return {"valid": True}
 
 # =========================
 # 📸 OCR
@@ -214,85 +232,73 @@ def generate_steps(task: str):
 @app.post("/api/vision")
 async def vision(file: UploadFile = File(...)):
     try:
-        image_bytes = await file.read()
-        base64_image = base64.b64encode(image_bytes).decode()
+        img = await file.read()
+        b64 = base64.b64encode(img).decode()
 
-        response = client.chat.completions.create(
+        res = client.chat.completions.create(
             model="gpt-4o",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": "Распознай текст полностью, сохрани строки"
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{base64_image}"
-                            },
-                        },
-                    ],
-                }
-            ],
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Распознай текст полностью"},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+                ]
+            }]
         )
 
-        text = response.choices[0].message.content or ""
-        return {"text": text}
-
-    except Exception:
+        return {"text": res.choices[0].message.content}
+    except:
         return {"text": ""}
 
 # =========================
-# ✂️ SPLIT API
+# ✂️ SPLIT
 # =========================
 @app.post("/api/split")
 async def split(req: TextRequest):
     try:
         text = clean_text(req.text)
-        tasks = split_tasks_smart(text)
-        return {"tasks": tasks}
-    except Exception:
+        return {"tasks": split_tasks_smart(text)}
+    except:
         return {"tasks": [req.text]}
 
 # =========================
-# 🚀 GENERATE API
+# 🚀 GENERATE
 # =========================
 @app.post("/api/generate")
 async def generate(req: TaskRequest):
     try:
-        data = generate_steps(req.task)
+        task = req.task.strip()
 
-        # защита от новых чисел
-        if contains_new_numbers(req.task, data):
-            data = generate_steps(
-                req.task + "\n\nНЕ ДОБАВЛЯЙ НОВЫЕ ЧИСЛА"
-            )
+        # примеры
+        if is_simple_expression(task):
+            return generate_simple_steps(task)
 
-        # защита от плохих вопросов
+        # сначала решаем
+        solution = solve_task_first(task)
+
+        # потом обучаем
+        data = generate_steps_from_plan(task, solution)
+
+        # защиты
+        if contains_new_numbers(task, data):
+            data = generate_steps_from_plan(task, solution)
+
         if any(is_bad_step(s) for s in data["steps"]):
-            data = generate_steps(
-                req.task + "\n\nНЕ задавай абстрактные вопросы"
-            )
+            data = generate_steps_from_plan(task, solution)
 
-        # проверка логики
-        validation = validate_steps(req.task, data["steps"])
-
-        if not validation.get("valid", True):
-            data = generate_steps(
-                req.task + "\n\nИсправь логику шагов"
-            )
+        val = validate_steps(task, data["steps"])
+        if not val.get("valid", True):
+            data = generate_steps_from_plan(task, solution)
 
         return data
 
-    except Exception:
+    except:
         return {
             "steps": [
                 {
-                    "question": "Не удалось разобрать задачу 😢",
+                    "question": "Ошибка 😢",
                     "answer": "",
-                    "hint": "Попробуй ещё раз"
+                    "hint": ""
                 }
             ]
         }
