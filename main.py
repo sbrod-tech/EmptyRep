@@ -53,13 +53,18 @@ async def vision(file: UploadFile = File(...)):
         tasks = data.get("tasks", [])
 
         clean = []
+
         for t in tasks:
             if isinstance(t, dict):
-                clean.append(t.get("task", ""))
+                val = t.get("task", "")
             else:
-                clean.append(str(t))
+                val = t
 
-        clean = [t for t in clean if t.strip()]
+            # всегда строка
+            val = str(val).strip()
+
+            if val:
+                clean.append(val)
 
         return {"tasks": clean or ["Не удалось распознать задачу"]}
 
