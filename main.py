@@ -35,7 +35,7 @@ class ChatMessageRequest(BaseModel):
 # ================= UTILS =================
 
 def extract_number(text: str):
-    nums = re.findall(r'\d+(?:\.\d+)?', text)
+    nums = re.findall(r'\d+(?:\.\d+)?', text.replace(',', '.'))
     return float(nums[-1]) if nums else None
 
 def detect_answer_type(text: str):
@@ -55,137 +55,69 @@ def is_help(text: str):
         "не понимаю", "как", "помоги", "объясни"
     ])
 
+def type_hint(expected_type):
+    if expected_type == "NUMBER":
+        return "Напиши число, например: 10"
+    if expected_type == "OPERATION":
+        return "Напиши действие, например: 10/2 или 5+3"
+    return "Ответь словами"
+
 # ================= SOLVER =================
 
 def solve_problem(problem: str):
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        response_format={"type": "json_object"},
-        messages=[
-            {
-                "role": "system",
-                "content": """
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            response_format={"type": "json_object"},
+            messages=[
+                {
+                    "role": "system",
+                    "content": """
 Ты учитель начальных классов.
 
-Разбей задачу на шаги.
+Разбей задачу на простые шаги.
 
-Типы:
-- NUMBER (число)
-- OPERATION (действие)
-- TEXT (объяснение)
+Каждый шаг:
+- понятный ребёнку
+- с примером ответа
+- с правильным expected_answer
 
-НЕ объясняй решение.
-
-Верни JSON:
+Верни:
 
 {
-  "answer": 26,
+  "answer": 33.75,
   "steps": [
-    {"question": "...", "type": "NUMBER"},
-    {"question": "...", "type": "OPERATION"}
-  ],
-  "strategy": "..."
-}
-"""
-            },
-            {"role": "user", "content": problem}
-        ]
-    )
-
-    return json.loads(response.choices[0].message.content)
-
-# ================= ANALYZE =================
-
-def analyze_answer(state, user_text, current_step):
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        response_format={"type": "json_object"},
-        messages=[
-            {
-                "role": "system",
-                "content": """
-Ты учитель.
-
-Проверь:
-1. Ответ относится к текущему вопросу
-2. Он логически верный
-
-НЕ давай правильный ответ.
-
-Верни:
-
-{
-  "correct": true/false,
-  "relevant": true/false,
-  "feedback": "...",
-  "hint": "..."
-}
-"""
-            },
-            {
-                "role": "user",
-                "content": f"""
-Задача:
-{state["problem"]}
-
-Вопрос:
-{current_step["question"]}
-
-Тип:
-{current_step["type"]}
-
-Ответ ученика:
-{user_text}
-"""
-            }
-        ]
-    )
-
-    return json.loads(response.choices[0].message.content)
-
-# ================= HELP =================
-
-def explain_step(state, current_step):
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        response_format={"type": "json_object"},
-        messages=[
-            {
-                "role": "system",
-                "content": """
-Объясни текущий шаг.
-
-НЕ решай задачу.
-НЕ давай ответ.
-
-Верни:
-{
-  "explain": "...",
-  "hint": "..."
-}
-"""
-            },
-            {
-                "role": "user",
-                "content": f"""
-Задача:
-{state["problem"]}
-
-Шаг:
-{current_step["question"]}
-"""
-            }
-        ]
-    )
-
-    data = json.loads(response.choices[0].message.content)
-
-    return {
-        "reply": data["explain"],
-        "question": current_step["question"],
-        "hint": data["hint"],
-        "emotion": "thinking"
+    {
+      "question": "Сколько сена на одну лошадь? (пример: 10/2 = 5)",
+      "type": "NUMBER",
+      "expected_answer": 33.75
     }
+  ],
+  "solution_steps": [
+    "135 / 4 = 33.75"
+  ]
+}
+"""
+                },
+                {"role": "user", "content": problem}
+            ]
+        )
+
+        return json.loads(response.choices[0].message.content)
+
+    except Exception:
+        # fallback
+        return {
+            "answer": 0,
+            "steps": [
+                {
+                    "question": "Попробуй переформулировать задачу",
+                    "type": "TEXT",
+                    "expected_answer": ""
+                }
+            ],
+            "solution_steps": []
+        }
 
 # ================= CHAT =================
 
@@ -203,7 +135,7 @@ def chat(data: ChatMessageRequest):
             "problem": text,
             "answer": solution["answer"],
             "steps": solution["steps"],
-            "strategy": solution["strategy"],
+            "solution_steps": solution.get("solution_steps", []),
             "step": 0
         }
 
@@ -212,7 +144,7 @@ def chat(data: ChatMessageRequest):
         return {
             "reply": "Давай разберём вместе 🐾",
             "question": first["question"],
-            "hint": f"Подумай: {solution['strategy']}",
+            "hint": type_hint(first["type"]),
             "emotion": "thinking"
         }
 
@@ -221,72 +153,117 @@ def chat(data: ChatMessageRequest):
 
     # ===== HELP =====
     if is_help(text):
-        return explain_step(state, current_step)
+        return {
+            "reply": "Давай разберёмся 👇",
+            "question": current_step["question"],
+            "hint": type_hint(current_step["type"]),
+            "emotion": "thinking"
+        }
 
     # ===== ПРОВЕРКА ТИПА =====
     user_type = detect_answer_type(text)
 
     if user_type != current_step["type"]:
         return {
-            "reply": "Сейчас нужен другой тип ответа 😊",
+            "reply": "Попробуй по-другому 😊",
             "question": current_step["question"],
-            "hint": f"Подумай, это должно быть: {current_step['type']}",
+            "hint": type_hint(current_step["type"]),
             "emotion": "confused"
         }
 
-    # ===== ФИНАЛ =====
-    user_num = extract_number(text)
+    # ===== ПРОВЕРКА ЧИСЛА =====
+    if current_step["type"] == "NUMBER":
+        user_num = extract_number(text)
 
-    if user_num is not None and state["step"] == len(state["steps"]) - 1:
-        if abs(user_num - state["answer"]) < 0.001:
-            state_memory.pop(user_id)
+        if user_num is None:
             return {
-                "reply": "Отлично! 🎉 Ты решил задачу!",
-                "question": "",
-                "hint": "",
-                "emotion": "proud"
+                "reply": "Попробуй написать число 😊",
+                "question": current_step["question"],
+                "hint": "Например: 10",
+                "emotion": "confused"
             }
 
-    # ===== АНАЛИЗ =====
-    analysis = analyze_answer(state, text, current_step)
+        correct = abs(user_num - current_step["expected_answer"]) < 0.01
 
-    # если не про тот шаг
-    if not analysis["relevant"]:
-        return {
-            "reply": "Мы сейчас думаем над другим шагом 😊",
-            "question": current_step["question"],
-            "hint": "Сконцентрируйся на текущем вопросе",
-            "emotion": "thinking"
-        }
+        if correct:
+            state["step"] += 1
 
-    # если верно → следующий шаг
-    if analysis["correct"]:
-        state["step"] += 1
+            # завершение
+            if state["step"] >= len(state["steps"]):
+                state_memory.pop(user_id)
 
-        if state["step"] >= len(state["steps"]):
-            state_memory.pop(user_id)
+                return {
+                    "reply": "Отлично! 🎉 Ты решил задачу!",
+                    "question": "",
+                    "hint": "",
+                    "emotion": "proud"
+                }
+
+            next_step = state["steps"][state["step"]]
+
             return {
-                "reply": "Супер! 🎉",
-                "question": "",
-                "hint": "",
-                "emotion": "proud"
+                "reply": "Верно 👍",
+                "question": next_step["question"],
+                "hint": type_hint(next_step["type"]),
+                "emotion": "happy"
+            }
+
+        else:
+            return {
+                "reply": "Почти! Попробуй ещё раз 😊",
+                "question": current_step["question"],
+                "hint": "Проверь вычисления",
+                "emotion": "thinking"
+            }
+
+    # ===== OPERATION =====
+    if current_step["type"] == "OPERATION":
+
+        if any(op in text for op in ["/", "дел"]):
+            state["step"] += 1
+        elif any(op in text for op in ["*", "x", "×", "умнож"]):
+            state["step"] += 1
+        elif any(op in text for op in ["+", "слож"]):
+            state["step"] += 1
+        elif any(op in text for op in ["-", "выч"]):
+            state["step"] += 1
+        else:
+            return {
+                "reply": "Подумай, какое действие нужно 😊",
+                "question": current_step["question"],
+                "hint": "Сложение, вычитание, умножение или деление?",
+                "emotion": "thinking"
             }
 
         next_step = state["steps"][state["step"]]
 
         return {
-            "reply": "Отлично 👍",
+            "reply": "Хорошо 👍",
             "question": next_step["question"],
-            "hint": analysis["hint"],
+            "hint": type_hint(next_step["type"]),
             "emotion": "happy"
         }
 
-    # если ошибка
+    # ===== TEXT =====
+    state["step"] += 1
+
+    if state["step"] >= len(state["steps"]):
+        state_memory.pop(user_id)
+
+        return {
+            "reply": "Отлично! 🎉",
+            "question": "",
+            "hint": "",
+            "emotion": "proud"
+        }
+
+    next_step = state["steps"][state["step"]]
+
     return {
-        "reply": analysis["feedback"],
-        "question": current_step["question"],
-        "hint": analysis["hint"],
-        "emotion": "thinking"
+        "reply": "Хорошо 👍",
+        "question": next_step["question"],
+        "hint": type_hint(next_step["type"]),
+        "emotion": "happy"
     }
 
 # ================= SOLUTION =================
@@ -298,7 +275,7 @@ def get_solution(user_id: str = Query(...)):
     if not state:
         return {"solution": "Нет активной задачи"}
 
-    return {"solution": "\n".join([s["question"] for s in state["steps"]])}
+    return {"solution": "\n".join(state["solution_steps"])}
 
 # ================= RESET =================
 
@@ -314,39 +291,43 @@ async def vision(file: UploadFile = File(...)):
     contents = await file.read()
     base64_image = base64.b64encode(contents).decode("utf-8")
 
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        response_format={"type": "json_object"},
-        messages=[
-            {
-                "role": "system",
-                "content": """
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            response_format={"type": "json_object"},
+            messages=[
+                {
+                    "role": "system",
+                    "content": """
 Найди задачи на изображении.
 НЕ решай.
 
-Верни JSON:
+Верни:
 {
   "tasks": ["..."]
 }
 """
-            },
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "Найди задачи"},
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{base64_image}"
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Найди задачи"},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{base64_image}"
+                            }
                         }
-                    }
-                ]
-            }
-        ]
-    )
+                    ]
+                }
+            ]
+        )
 
-    data = json.loads(response.choices[0].message.content)
-    return {"tasks": data.get("tasks", [])}
+        data = json.loads(response.choices[0].message.content)
+        return {"tasks": data.get("tasks", [])}
+
+    except Exception:
+        return {"tasks": []}
 
 # ================= HEALTH =================
 
