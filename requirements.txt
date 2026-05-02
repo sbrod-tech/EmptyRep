@@ -2,3 +2,7 @@ fastapi
 uvicorn
 openai>=1.0.0
 python-multipart
+pillow
+pytesseract
+opencv-python-headless
+numpy
