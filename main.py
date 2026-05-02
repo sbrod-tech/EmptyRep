@@ -44,45 +44,61 @@ def root():
 
 
 # =========================
-# 🧹 ОЧИСТКА ТЕКСТА
+# 🧹 CLEAN TEXT
 # =========================
 def clean_text(text: str):
     text = text.replace('\r', '\n')
     text = re.sub(r'\n+', '\n', text)
-    text = re.sub(r'\.{3,}', ' ', text)  # убираем "..."
-    text = re.sub(r'\s+', ' ', text)
+
+    # убираем мусорные символы OCR
+    text = text.replace('•', ' ')
+    text = text.replace('·', ' ')
+    text = text.replace('|', ' ')
+    text = text.replace('—', '-')
+
     return text.strip()
 
 
 # =========================
-# ✂️ УМНЫЙ SPLIT
+# ✂️ УМНЫЙ SPLIT (УЛУЧШЕННЫЙ)
 # =========================
 def split_tasks_smart(text: str):
-    matches = list(re.finditer(r'(?<!\d)(\d{2,3})[\.\)]?\s', text))
-
-    if not matches:
-        return [text]
+    lines = [l.strip() for l in text.split('\n') if l.strip()]
 
     tasks = []
+    current_task = ""
 
-    for i in range(len(matches)):
-        start = matches[i].start()
-
-        if i + 1 < len(matches):
-            end = matches[i + 1].start()
+    for line in lines:
+        # старт новой задачи
+        if re.match(r'^\d{2,3}[\.\)]?\s', line):
+            if current_task:
+                tasks.append(current_task.strip())
+            current_task = line
         else:
-            end = len(text)
+            if current_task:
+                current_task += " " + line
 
-        task = text[start:end].strip()
+    if current_task:
+        tasks.append(current_task.strip())
 
-        if len(task) > 20:
-            tasks.append(task)
+    # =========================
+    # 🧠 ФИЛЬТРЫ
+    # =========================
+
+    # убираем короткие куски
+    tasks = [t for t in tasks if len(t) > 40]
+
+    # убираем чисто числовой мусор
+    tasks = [
+        t for t in tasks
+        if re.search(r'[а-яА-Я]', t)
+    ]
 
     return tasks
 
 
 # =========================
-# 📸 OCR (УЛУЧШЕННЫЙ)
+# 📸 OCR
 # =========================
 @app.post("/api/vision")
 async def vision(file: UploadFile = File(...)):
@@ -99,14 +115,15 @@ async def vision(file: UploadFile = File(...)):
                         {
                             "type": "text",
                             "text": """
-Распознай ВЕСЬ текст на изображении.
+Распознай ВЕСЬ текст на изображении максимально точно.
 
 ПРАВИЛА:
-- НЕ сокращай
+- НЕ сокращай текст
 - НЕ пересказывай
-- НЕ убирай слова
-- СОХРАНИ порядок
-- СОХРАНИ числа и единицы
+- СОХРАНИ порядок строк
+- СОХРАНИ переносы строк
+- НЕ объединяй абзацы
+- НЕ исправляй смысл
 
 Верни только текст.
 """
@@ -126,7 +143,7 @@ async def vision(file: UploadFile = File(...)):
 
         return {"text": text}
 
-    except Exception:
+    except Exception as e:
         return {"text": ""}
 
 
@@ -158,15 +175,15 @@ async def generate(req: TaskRequest):
                 {
                     "role": "user",
                     "content": f"""
-Ты помощник для детей (1–5 класс).
+Ты помощник по математике для детей 1–5 класса.
 
-Разбей задачу на шаги.
+Разбей задачу на маленькие шаги.
 
 ПРАВИЛА:
 - НЕ давай сразу ответ
-- веди ребёнка через вопросы
-- шаги простые
-- без сложных формулировок
+- веди через вопросы
+- шаги простые и понятные
+- дружелюбный стиль
 
 Верни JSON:
 
