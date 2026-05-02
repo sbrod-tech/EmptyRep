@@ -51,16 +51,14 @@ def detect_answer_type(text: str):
 
 def is_help(text: str):
     text = text.lower()
-    return any(w in text for w in [
-        "не понимаю", "как", "помоги", "объясни"
-    ])
+    return any(w in text for w in ["не понимаю", "как", "помоги", "объясни"])
 
-def type_hint(expected_type):
-    if expected_type == "NUMBER":
-        return "Напиши число, например: 10"
-    if expected_type == "OPERATION":
-        return "Напиши действие, например: 10/2 или 5+3"
-    return "Ответь словами"
+def type_hint(t):
+    return {
+        "NUMBER": "Напиши число, например: 10",
+        "OPERATION": "Напиши действие, например: 10/2",
+        "TEXT": "Ответь словами"
+    }.get(t, "")
 
 # ================= SOLVER =================
 
@@ -73,14 +71,14 @@ def solve_problem(problem: str):
                 {
                     "role": "system",
                     "content": """
-Ты учитель начальных классов.
+Ты учитель младших классов.
 
 Разбей задачу на простые шаги.
 
 Каждый шаг:
-- понятный ребёнку
-- с примером ответа
-- с правильным expected_answer
+- понятный
+- с примером
+- с expected_answer
 
 Верни:
 
@@ -88,7 +86,7 @@ def solve_problem(problem: str):
   "answer": 33.75,
   "steps": [
     {
-      "question": "Сколько сена на одну лошадь? (пример: 10/2 = 5)",
+      "question": "Сколько сена на одну лошадь? (пример: 10/2=5)",
       "type": "NUMBER",
       "expected_answer": 33.75
     }
@@ -105,17 +103,16 @@ def solve_problem(problem: str):
 
         return json.loads(response.choices[0].message.content)
 
-    except Exception:
-        # fallback
+    except Exception as e:
+        print("SOLVER ERROR:", e)
+
         return {
             "answer": 0,
-            "steps": [
-                {
-                    "question": "Попробуй переформулировать задачу",
-                    "type": "TEXT",
-                    "expected_answer": ""
-                }
-            ],
+            "steps": [{
+                "question": "Попробуй ещё раз сформулировать задачу",
+                "type": "TEXT",
+                "expected_answer": ""
+            }],
             "solution_steps": []
         }
 
@@ -128,7 +125,6 @@ def chat(data: ChatMessageRequest):
 
     # ===== НОВАЯ ЗАДАЧА =====
     if user_id not in state_memory:
-
         solution = solve_problem(text)
 
         state_memory[user_id] = {
@@ -149,109 +145,70 @@ def chat(data: ChatMessageRequest):
         }
 
     state = state_memory[user_id]
-    current_step = state["steps"][state["step"]]
+    current = state["steps"][state["step"]]
 
     # ===== HELP =====
     if is_help(text):
         return {
             "reply": "Давай разберёмся 👇",
-            "question": current_step["question"],
-            "hint": type_hint(current_step["type"]),
+            "question": current["question"],
+            "hint": type_hint(current["type"]),
             "emotion": "thinking"
         }
 
-    # ===== ПРОВЕРКА ТИПА =====
-    user_type = detect_answer_type(text)
-
-    if user_type != current_step["type"]:
+    # ===== TYPE CHECK =====
+    if detect_answer_type(text) != current["type"]:
         return {
             "reply": "Попробуй по-другому 😊",
-            "question": current_step["question"],
-            "hint": type_hint(current_step["type"]),
+            "question": current["question"],
+            "hint": type_hint(current["type"]),
             "emotion": "confused"
         }
 
-    # ===== ПРОВЕРКА ЧИСЛА =====
-    if current_step["type"] == "NUMBER":
-        user_num = extract_number(text)
+    # ===== NUMBER =====
+    if current["type"] == "NUMBER":
+        num = extract_number(text)
 
-        if user_num is None:
+        if num is None:
             return {
-                "reply": "Попробуй написать число 😊",
-                "question": current_step["question"],
+                "reply": "Нужно написать число 😊",
+                "question": current["question"],
                 "hint": "Например: 10",
                 "emotion": "confused"
             }
 
-        correct = abs(user_num - current_step["expected_answer"]) < 0.01
-
-        if correct:
+        if abs(num - current["expected_answer"]) < 0.01:
             state["step"] += 1
-
-            # завершение
-            if state["step"] >= len(state["steps"]):
-                state_memory.pop(user_id)
-
-                return {
-                    "reply": "Отлично! 🎉 Ты решил задачу!",
-                    "question": "",
-                    "hint": "",
-                    "emotion": "proud"
-                }
-
-            next_step = state["steps"][state["step"]]
-
-            return {
-                "reply": "Верно 👍",
-                "question": next_step["question"],
-                "hint": type_hint(next_step["type"]),
-                "emotion": "happy"
-            }
-
         else:
             return {
-                "reply": "Почти! Попробуй ещё раз 😊",
-                "question": current_step["question"],
+                "reply": "Почти! Попробуй ещё 😊",
+                "question": current["question"],
                 "hint": "Проверь вычисления",
                 "emotion": "thinking"
             }
 
     # ===== OPERATION =====
-    if current_step["type"] == "OPERATION":
-
-        if any(op in text for op in ["/", "дел"]):
-            state["step"] += 1
-        elif any(op in text for op in ["*", "x", "×", "умнож"]):
-            state["step"] += 1
-        elif any(op in text for op in ["+", "слож"]):
-            state["step"] += 1
-        elif any(op in text for op in ["-", "выч"]):
+    elif current["type"] == "OPERATION":
+        if any(op in text for op in ["+", "-", "*", "/", "x", "×"]):
             state["step"] += 1
         else:
             return {
-                "reply": "Подумай, какое действие нужно 😊",
-                "question": current_step["question"],
-                "hint": "Сложение, вычитание, умножение или деление?",
+                "reply": "Нужно выбрать действие 😊",
+                "question": current["question"],
+                "hint": "Сложение, деление, умножение или вычитание?",
                 "emotion": "thinking"
             }
 
-        next_step = state["steps"][state["step"]]
-
-        return {
-            "reply": "Хорошо 👍",
-            "question": next_step["question"],
-            "hint": type_hint(next_step["type"]),
-            "emotion": "happy"
-        }
-
     # ===== TEXT =====
-    state["step"] += 1
+    else:
+        state["step"] += 1
 
+    # ===== NEXT STEP =====
     if state["step"] >= len(state["steps"]):
         state_memory.pop(user_id)
 
         return {
-            "reply": "Отлично! 🎉",
+            "reply": "Отлично! 🎉 Ты решил задачу!",
             "question": "",
             "hint": "",
             "emotion": "proud"
@@ -260,7 +217,7 @@ def chat(data: ChatMessageRequest):
     next_step = state["steps"][state["step"]]
 
     return {
-        "reply": "Хорошо 👍",
+        "reply": "Верно 👍",
         "question": next_step["question"],
         "hint": type_hint(next_step["type"]),
         "emotion": "happy"
@@ -299,10 +256,10 @@ async def vision(file: UploadFile = File(...)):
                 {
                     "role": "system",
                     "content": """
-Найди задачи на изображении.
-НЕ решай.
+Найди ВСЕ задачи на изображении.
 
-Верни:
+Даже если одна — верни её.
+
 {
   "tasks": ["..."]
 }
@@ -324,10 +281,19 @@ async def vision(file: UploadFile = File(...)):
         )
 
         data = json.loads(response.choices[0].message.content)
-        return {"tasks": data.get("tasks", [])}
+        tasks = data.get("tasks", [])
 
-    except Exception:
-        return {"tasks": []}
+        if not tasks:
+            tasks = ["Не удалось распознать задачу. Попробуй сфотографировать ближе"]
+
+        return {"tasks": tasks}
+
+    except Exception as e:
+        print("VISION ERROR:", e)
+
+        return {
+            "tasks": ["Ошибка распознавания. Попробуй ещё раз"]
+        }
 
 # ================= HEALTH =================
 
