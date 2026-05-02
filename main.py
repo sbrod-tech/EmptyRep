@@ -44,44 +44,11 @@ def is_new_problem(text: str):
         ])
     )
 
-def parse_user_answer(text: str):
-    t = text.lower().replace(",", ".").strip()
+def extract_number(text: str):
+    nums = re.findall(r'\d+', text)
+    return int(nums[-1]) if nums else None
 
-    # время
-    m_time = re.search(r'(\d{1,2})[:.](\d{2})', t)
-    if m_time:
-        h, m = int(m_time.group(1)), int(m_time.group(2))
-        return {"type": "time", "value": h * 60 + m}
-
-    # число
-    m_num = re.search(r'(\d+(\.\d+)?)', t)
-    if m_num:
-        val = float(m_num.group(1))
-        return {"type": "number", "value": val}
-
-    return {"type": "unknown", "value": None}
-
-def is_close(a, b, tol=1e-6):
-    try:
-        return abs(float(a) - float(b)) <= tol
-    except:
-        return False
-
-def detect_error(user, correct):
-    if user["type"] == "unknown":
-        return "no_number"
-
-    if correct["type"] == "number":
-        if not is_close(user["value"], correct["value"]):
-            return "wrong_value"
-
-    if correct["type"] == "time":
-        if user["value"] != correct["value"]:
-            return "wrong_time"
-
-    return "ok"
-
-# ================= GPT STEP GENERATION =================
+# ================= STEP GENERATION =================
 
 def generate_steps(problem, grade):
     try:
@@ -96,10 +63,9 @@ def generate_steps(problem, grade):
 
 ВАЖНО:
 - каждый шаг = вопрос
-- у каждого шага есть ответ
+- у каждого шага есть числовой ответ
 
 Формат:
-
 {{
   "steps": [
     {{ "question": "...", "answer": 36 }},
@@ -117,13 +83,11 @@ def generate_steps(problem, grade):
         return json.loads(response.choices[0].message.content)["steps"]
 
     except Exception:
-        return [
-            {"question": "Попробуй понять условие задачи", "answer": 0}
-        ]
+        return [{"question": "Попробуй разобраться в задаче", "answer": 0}]
 
-# ================= GPT ERROR EXPLAIN =================
+# ================= ERROR EXPLAIN =================
 
-def explain_error(step, user_text, correct_value, error_type, grade):
+def explain_error(step, user_text, correct_value, grade):
     try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -143,13 +107,10 @@ def explain_error(step, user_text, correct_value, error_type, grade):
 Правильный ответ:
 {correct_value}
 
-Тип ошибки:
-{error_type}
-
 Сделай:
 - короткое объяснение (1 строка)
 - повтори вопрос
-- дай подсказку
+- 1 подсказку
 
 Строго JSON:
 {{
@@ -192,12 +153,17 @@ def chat(data: ChatMessageRequest):
         state_memory[user_id] = {
             "problem": text,
             "steps": steps,
-            "current_step": 0
+            "current_step": 0,
+            "last_question": None
         }
+
+        first_question = steps[0]["question"]
+
+        state_memory[user_id]["last_question"] = first_question
 
         return {
             "reply": "Давай решим задачу вместе 🐾",
-            "question": steps[0]["question"],
+            "question": first_question,
             "hint": "",
             "emotion": "thinking"
         }
@@ -206,16 +172,20 @@ def chat(data: ChatMessageRequest):
     state = state_memory[user_id]
     step_data = state["steps"][state["current_step"]]
 
-    correct = {
-        "type": "number",
-        "value": step_data["answer"]
-    }
+    correct = step_data["answer"]
+    user_number = extract_number(text)
 
-    user = parse_user_answer(text)
-    error_type = detect_error(user, correct)
+    # ===== НЕ ПОНЯЛ ОТВЕТ =====
+    if user_number is None:
+        return {
+            "reply": "Попробуй ответить числом 🐾",
+            "question": step_data["question"],
+            "hint": "",
+            "emotion": "thinking"
+        }
 
-    # ===== CORRECT =====
-    if error_type == "ok":
+    # ===== ПРАВИЛЬНО =====
+    if user_number == correct:
         state["current_step"] += 1
 
         if state["current_step"] >= len(state["steps"]):
@@ -227,19 +197,36 @@ def chat(data: ChatMessageRequest):
             }
 
         next_step = state["steps"][state["current_step"]]
+        next_question = next_step["question"]
+
+        # защита от повтора
+        if next_question == state["last_question"]:
+            state["current_step"] += 1
+
+            if state["current_step"] >= len(state["steps"]):
+                return {
+                    "reply": "Отлично! 🎉",
+                    "question": "",
+                    "hint": "",
+                    "emotion": "proud"
+                }
+
+            next_step = state["steps"][state["current_step"]]
+            next_question = next_step["question"]
+
+        state["last_question"] = next_question
 
         return {
             "reply": "Верно 👍",
-            "question": next_step["question"],
+            "question": next_question,
             "hint": "",
             "emotion": "happy"
         }
 
-    # ===== ERROR =====
+    # ===== ОШИБКА =====
     return explain_error(
         step=step_data["question"],
         user_text=text,
-        correct_value=step_data["answer"],
-        error_type=error_type,
+        correct_value=correct,
         grade=data.grade
     )
