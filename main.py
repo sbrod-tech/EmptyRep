@@ -64,24 +64,17 @@ def split_tasks_smart(text: str):
     tasks = []
     current_task = ""
 
-    task_starters = [
-        "найди",
-        "определи",
-        "запиши",
-        "реши",
-        "вычисли",
-        "сколько",
-        "с какой",
-        "вырежи",
-        "начерти"
+    starters = [
+        "найди", "определи", "запиши", "реши",
+        "вычисли", "сколько", "с какой",
+        "вырежи", "начерти"
     ]
 
     def is_new_task(line):
         if re.match(r'^\d{2,3}[\.\)]?\s', line):
             return True
-
         lower = line.lower()
-        return any(lower.startswith(word) for word in task_starters)
+        return any(lower.startswith(w) for w in starters)
 
     for line in lines:
         if is_new_task(line):
@@ -108,75 +101,53 @@ def split_tasks_smart(text: str):
 def contains_new_numbers(task, steps):
     task_numbers = set(re.findall(r'\d+', task))
     steps_numbers = set(re.findall(r'\d+', json.dumps(steps)))
-
     return not steps_numbers.issubset(task_numbers)
 
 
 # =========================
-# 📸 OCR
+# 🧠 ПРОВЕРКА ЛОГИКИ
 # =========================
-@app.post("/api/vision")
-async def vision(file: UploadFile = File(...)):
+def validate_steps(task: str, steps: list):
     try:
-        image_bytes = await file.read()
-        base64_image = base64.b64encode(image_bytes).decode()
-
         response = client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-4o-mini",
+            response_format={"type": "json_object"},
             messages=[
                 {
                     "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": """
-Распознай ВЕСЬ текст на изображении максимально точно.
+                    "content": f"""
+Ты проверяешь решение задачи для ребёнка.
 
-ПРАВИЛА:
-- НЕ сокращай текст
-- НЕ пересказывай
-- СОХРАНИ переносы строк
-- СОХРАНИ порядок
+ЗАДАЧА:
+{task}
 
-Верни только текст.
+ШАГИ:
+{json.dumps(steps, ensure_ascii=False)}
+
+ПРОВЕРЬ:
+- логика корректна?
+- шаги связаны с задачей?
+- нет ли угадывания?
+
+Ответь:
+
+{{ "valid": true }}
+или
+{{ "valid": false, "reason": "коротко" }}
 """
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{base64_image}"
-                            },
-                        },
-                    ],
                 }
             ],
         )
 
-        text = response.choices[0].message.content or ""
-
-        return {"text": text}
-
-    except Exception:
-        return {"text": ""}
-
-
-# =========================
-# ✂️ SPLIT API
-# =========================
-@app.post("/api/split")
-async def split(req: TextRequest):
-    try:
-        text = clean_text(req.text)
-        tasks = split_tasks_smart(text)
-
-        return {"tasks": tasks}
+        raw = response.choices[0].message.content
+        return json.loads(raw)
 
     except Exception:
-        return {"tasks": [req.text]}
+        return {"valid": True}
 
 
 # =========================
-# 🧠 GENERATE STEPS (С ЗАЩИТОЙ)
+# 🧠 ГЕНЕРАЦИЯ ШАГОВ
 # =========================
 def generate_steps(task: str):
     response = client.chat.completions.create(
@@ -188,16 +159,12 @@ def generate_steps(task: str):
                 "content": f"""
 Ты помощник по математике для детей 1–5 класса.
 
-❗ ОЧЕНЬ ВАЖНО:
-- Используй ТОЛЬКО числа из задачи
-- НЕ придумывай новые числа
-- НЕ добавляй "например"
+❗ ПРАВИЛА:
+- Используй только данные задачи
+- НЕ придумывай числа
 - НЕ меняй условия
-
-ПРАВИЛА:
-- задавай вопросы
-- шаги простые
-- без ответа сразу
+- НЕ давай ответ сразу
+- каждый шаг простой
 
 Верни JSON:
 
@@ -222,19 +189,70 @@ def generate_steps(task: str):
     return json.loads(raw)
 
 
+# =========================
+# 📸 OCR
+# =========================
+@app.post("/api/vision")
+async def vision(file: UploadFile = File(...)):
+    try:
+        image_bytes = await file.read()
+        base64_image = base64.b64encode(image_bytes).decode()
+
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Распознай текст полностью, сохрани строки"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
+                        }
+                    ],
+                }
+            ],
+        )
+
+        text = response.choices[0].message.content or ""
+        return {"text": text}
+
+    except Exception:
+        return {"text": ""}
+
+
+# =========================
+# ✂️ SPLIT API
+# =========================
+@app.post("/api/split")
+async def split(req: TextRequest):
+    try:
+        text = clean_text(req.text)
+        tasks = split_tasks_smart(text)
+        return {"tasks": tasks}
+    except Exception:
+        return {"tasks": [req.text]}
+
+
+# =========================
+# 🚀 GENERATE API
+# =========================
 @app.post("/api/generate")
 async def generate(req: TaskRequest):
     try:
-        # первая попытка
+        # 1. генерация
         data = generate_steps(req.task)
 
-        # проверка на фантазию
+        # 2. проверка чисел
         if contains_new_numbers(req.task, data):
-            print("⚠️ Найдена фантазия, перегенерация...")
+            data = generate_steps(req.task + "\n\nНЕ ДОБАВЛЯЙ НОВЫЕ ЧИСЛА")
 
-            # вторая попытка с усилением
+        # 3. проверка логики
+        validation = validate_steps(req.task, data)
+
+        if not validation.get("valid", True):
             data = generate_steps(
-                req.task + "\n\n❗ ЕЩЁ РАЗ: НЕЛЬЗЯ ДОБАВЛЯТЬ НОВЫЕ ЧИСЛА!"
+                req.task + "\n\nИсправь логику. Шаги должны быть последовательными"
             )
 
         return data
