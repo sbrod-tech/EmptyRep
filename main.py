@@ -19,9 +19,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# =========================
-# 🤖 OpenAI
-# =========================
 client = OpenAI()
 
 # =========================
@@ -50,7 +47,6 @@ def clean_text(text: str):
     text = text.replace('\r', '\n')
     text = re.sub(r'\n+', '\n', text)
 
-    # убираем мусорные символы OCR
     text = text.replace('•', ' ')
     text = text.replace('·', ' ')
     text = text.replace('|', ' ')
@@ -60,7 +56,7 @@ def clean_text(text: str):
 
 
 # =========================
-# ✂️ УМНЫЙ SPLIT (УЛУЧШЕННЫЙ)
+# ✂️ SMART SPLIT
 # =========================
 def split_tasks_smart(text: str):
     lines = [l.strip() for l in text.split('\n') if l.strip()]
@@ -68,9 +64,27 @@ def split_tasks_smart(text: str):
     tasks = []
     current_task = ""
 
-    for line in lines:
-        # старт новой задачи
+    task_starters = [
+        "найди",
+        "определи",
+        "запиши",
+        "реши",
+        "вычисли",
+        "сколько",
+        "с какой",
+        "вырежи",
+        "начерти"
+    ]
+
+    def is_new_task(line):
         if re.match(r'^\d{2,3}[\.\)]?\s', line):
+            return True
+
+        lower = line.lower()
+        return any(lower.startswith(word) for word in task_starters)
+
+    for line in lines:
+        if is_new_task(line):
             if current_task:
                 tasks.append(current_task.strip())
             current_task = line
@@ -81,20 +95,21 @@ def split_tasks_smart(text: str):
     if current_task:
         tasks.append(current_task.strip())
 
-    # =========================
-    # 🧠 ФИЛЬТРЫ
-    # =========================
-
-    # убираем короткие куски
+    # фильтры
     tasks = [t for t in tasks if len(t) > 40]
-
-    # убираем чисто числовой мусор
-    tasks = [
-        t for t in tasks
-        if re.search(r'[а-яА-Я]', t)
-    ]
+    tasks = [t for t in tasks if re.search(r'[а-яА-Я]', t)]
 
     return tasks
+
+
+# =========================
+# 🔢 АНТИ-ФАНТАЗИЯ
+# =========================
+def contains_new_numbers(task, steps):
+    task_numbers = set(re.findall(r'\d+', task))
+    steps_numbers = set(re.findall(r'\d+', json.dumps(steps)))
+
+    return not steps_numbers.issubset(task_numbers)
 
 
 # =========================
@@ -120,10 +135,8 @@ async def vision(file: UploadFile = File(...)):
 ПРАВИЛА:
 - НЕ сокращай текст
 - НЕ пересказывай
-- СОХРАНИ порядок строк
 - СОХРАНИ переносы строк
-- НЕ объединяй абзацы
-- НЕ исправляй смысл
+- СОХРАНИ порядок
 
 Верни только текст.
 """
@@ -143,7 +156,7 @@ async def vision(file: UploadFile = File(...)):
 
         return {"text": text}
 
-    except Exception as e:
+    except Exception:
         return {"text": ""}
 
 
@@ -163,27 +176,28 @@ async def split(req: TextRequest):
 
 
 # =========================
-# 🧠 GENERATE STEPS
+# 🧠 GENERATE STEPS (С ЗАЩИТОЙ)
 # =========================
-@app.post("/api/generate")
-async def generate(req: TaskRequest):
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            response_format={"type": "json_object"},
-            messages=[
-                {
-                    "role": "user",
-                    "content": f"""
+def generate_steps(task: str):
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        response_format={"type": "json_object"},
+        messages=[
+            {
+                "role": "user",
+                "content": f"""
 Ты помощник по математике для детей 1–5 класса.
 
-Разбей задачу на маленькие шаги.
+❗ ОЧЕНЬ ВАЖНО:
+- Используй ТОЛЬКО числа из задачи
+- НЕ придумывай новые числа
+- НЕ добавляй "например"
+- НЕ меняй условия
 
 ПРАВИЛА:
-- НЕ давай сразу ответ
-- веди через вопросы
-- шаги простые и понятные
-- дружелюбный стиль
+- задавай вопросы
+- шаги простые
+- без ответа сразу
 
 Верни JSON:
 
@@ -198,14 +212,30 @@ async def generate(req: TaskRequest):
 }}
 
 Задача:
-{req.task}
+{task}
 """
-                }
-            ],
-        )
+            }
+        ],
+    )
 
-        raw = response.choices[0].message.content
-        data = json.loads(raw)
+    raw = response.choices[0].message.content
+    return json.loads(raw)
+
+
+@app.post("/api/generate")
+async def generate(req: TaskRequest):
+    try:
+        # первая попытка
+        data = generate_steps(req.task)
+
+        # проверка на фантазию
+        if contains_new_numbers(req.task, data):
+            print("⚠️ Найдена фантазия, перегенерация...")
+
+            # вторая попытка с усилением
+            data = generate_steps(
+                req.task + "\n\n❗ ЕЩЁ РАЗ: НЕЛЬЗЯ ДОБАВЛЯТЬ НОВЫЕ ЧИСЛА!"
+            )
 
         return data
 
