@@ -7,7 +7,7 @@ import json
 app = FastAPI()
 client = OpenAI()
 
-# 🔥 Хранилище сессий
+# 🔥 in-memory sessions (для MVP)
 sessions = {}
 
 app.add_middleware(
@@ -42,16 +42,8 @@ async def vision(file: UploadFile = File(...)):
                 {
                     "role": "user",
                     "content": [
-                        {
-                            "type": "text",
-                            "text": "Извлеки ВСЕ математические задачи. Верни JSON: {\"tasks\": []}"
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{base64_image}"
-                            }
-                        }
+                        {"type": "text", "text": "Извлеки ВСЕ математические задачи. Верни JSON: {\"tasks\": []}"},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
                     ],
                 }
             ],
@@ -63,13 +55,15 @@ async def vision(file: UploadFile = File(...)):
         data = json.loads(raw)
         tasks = data.get("tasks", [])
 
-        # 🔥 нормализация
+        # 🔥 нормализация в List[str]
         clean_tasks = []
         for t in tasks:
             if isinstance(t, dict):
                 clean_tasks.append(t.get("task", ""))
             else:
                 clean_tasks.append(str(t))
+
+        clean_tasks = [t for t in clean_tasks if t.strip()]
 
         if not clean_tasks:
             return {"tasks": ["Не удалось распознать задачу"]}
@@ -85,13 +79,14 @@ async def vision(file: UploadFile = File(...)):
 # 🧠 РЕШЕНИЕ + ШАГИ
 # =========================
 def generate_solution(task: str):
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        response_format={"type": "json_object"},
-        messages=[
-            {
-                "role": "user",
-                "content": f"""
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            response_format={"type": "json_object"},
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"""
 Реши задачу и обучай ребёнка (4 класс).
 
 Задача:
@@ -105,7 +100,7 @@ def generate_solution(task: str):
   "steps": [
     {{
       "question": "вопрос ученику",
-      "answer": "ответ",
+      "answer": "правильный ответ",
       "hint": "подсказка"
     }}
   ]
@@ -114,16 +109,96 @@ def generate_solution(task: str):
 ВАЖНО:
 - сначала реши задачу
 - затем разбей на шаги
-- шаги должны быть конкретными
+- не давай сразу ответ ученику
 """
-            }
-        ],
-    )
+                }
+            ],
+        )
 
-    raw = response.choices[0].message.content
-    print("STEPS RAW:", raw)
+        raw = response.choices[0].message.content
+        print("STEPS RAW:", raw)
 
-    return json.loads(raw)
+        data = json.loads(raw)
+
+        # минимальная защита
+        data.setdefault("intro", "Давай разберёмся с задачей.")
+        data.setdefault("solution", "Нет решения")
+        data.setdefault("steps", [])
+
+        if not data["steps"]:
+            data["steps"] = [{
+                "question": "С чего начнём решение?",
+                "answer": "",
+                "hint": "Подумай, какое действие нужно выполнить"
+            }]
+
+        return data
+
+    except Exception as e:
+        print("GEN ERROR:", e)
+        return {
+            "intro": "Давай попробуем решить задачу вместе.",
+            "solution": "Ошибка генерации решения",
+            "steps": [{
+                "question": "Какое первое действие?",
+                "answer": "",
+                "hint": "Посмотри на задачу внимательно"
+            }]
+        }
+
+
+# =========================
+# 🧠 AI ПРОВЕРКА ОТВЕТА
+# =========================
+def check_answer_with_ai(task, step, user_answer, correct_answer):
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            response_format={"type": "json_object"},
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"""
+Ты проверяешь ответ ученика (4 класс).
+
+Задача:
+{task}
+
+Шаг:
+{step['question']}
+
+Правильный ответ:
+{correct_answer}
+
+Ответ ученика:
+{user_answer}
+
+Верни JSON:
+
+{{
+  "status": "correct | almost | wrong",
+  "explanation": "коротко объясни",
+  "hint": "подсказка"
+}}
+
+Правила:
+- correct → полностью верно
+- almost → небольшая ошибка
+- wrong → ошибка
+"""
+                }
+            ],
+        )
+
+        return json.loads(response.choices[0].message.content)
+
+    except Exception as e:
+        print("CHECK ERROR:", e)
+        return {
+            "status": "wrong",
+            "explanation": "Не удалось проверить ответ",
+            "hint": "Попробуй ещё раз"
+        }
 
 
 # =========================
@@ -132,18 +207,15 @@ def generate_solution(task: str):
 @app.post("/api/chat/message")
 async def chat(data: dict):
     try:
-        message = data.get("message")
+        message = data.get("message", "")
         session_id = data.get("session_id")
 
         if not session_id:
             return {"reply": "Ошибка: нет session_id"}
 
-        # =========================
         # 🚀 ПЕРВЫЙ ЗАПУСК
-        # =========================
         if session_id not in sessions:
             task = message
-
             generated = generate_solution(task)
 
             sessions[session_id] = {
@@ -162,9 +234,7 @@ async def chat(data: dict):
                 "emotion": "thinking"
             }
 
-        # =========================
         # 📚 ПРОДОЛЖЕНИЕ
-        # =========================
         session = sessions[session_id]
         steps = session["steps"]
         i = session["current_step"]
@@ -177,13 +247,17 @@ async def chat(data: dict):
 
         current = steps[i]
 
-        user_answer = message.strip().lower()
-        correct = current["answer"].strip().lower()
+        # 🧠 AI проверка
+        result = check_answer_with_ai(
+            session["task"],
+            current,
+            message,
+            current["answer"]
+        )
 
-        # =========================
-        # ✅ ПРОВЕРКА
-        # =========================
-        if user_answer == correct:
+        status = result.get("status", "wrong")
+
+        if status == "correct":
             session["current_step"] += 1
 
             if session["current_step"] >= len(steps):
@@ -200,10 +274,17 @@ async def chat(data: dict):
                 "emotion": "happy"
             }
 
+        elif status == "almost":
+            return {
+                "reply": f"Почти 👍\n{result['explanation']}",
+                "hint": result["hint"],
+                "emotion": "thinking"
+            }
+
         else:
             return {
-                "reply": f"Не совсем так 🤔\n\n👉 {current['question']}",
-                "hint": current["hint"],
+                "reply": f"Не совсем так 🤔\n{result['explanation']}",
+                "hint": result["hint"],
                 "emotion": "confused"
             }
 
