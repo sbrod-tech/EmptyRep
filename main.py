@@ -1,30 +1,16 @@
 import os
 import json
+import base64
 import re
-import numpy as np
 
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-
-# --- OCR libs ---
-try:
-    import cv2
-    from PIL import Image
-    import pytesseract
-
-    OCR_AVAILABLE = True
-except Exception as e:
-    print("OCR INIT ERROR:", e)
-    OCR_AVAILABLE = False
-
-# --- OpenAI ---
 from openai import OpenAI
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# ================= INIT =================
 
-# --- INIT APP ---
-app = FastAPI(title="Murmatika API 🐾")
+app = FastAPI(title="Murmatika Vision API 🐾")
 
 app.add_middleware(
     CORSMiddleware,
@@ -34,43 +20,39 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- MEMORY ---
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# ================= MEMORY =================
+
 state_memory = {}
 
-# --- MODELS ---
+# ================= MODELS =================
+
 class ChatMessageRequest(BaseModel):
     name: str
     grade: int
     message: str
     user_id: str
 
-
-# =========================
-# UTILS
-# =========================
+# ================= UTILS =================
 
 def extract_number(text: str):
     nums = re.findall(r'\d+', text)
     return int(nums[-1]) if nums else None
 
-
 def is_simple_addition(text: str):
     return re.match(r'^\d+\s*\+\s*\d+$', text.strip())
 
-
-# =========================
-# STEP ENGINE (без GPT)
-# =========================
+# ================= STEP ENGINE =================
 
 def build_addition_steps(text):
     a, b = map(int, re.findall(r'\d+', text))
-
     to10 = 10 - a
 
     if b > to10:
         rest = b - to10
         return [
-            {"q": f"Сколько нужно добавить к {a}, чтобы получить 10?", "a": to10},
+            {"q": f"Сколько нужно добавить к {a}, чтобы получилось 10?", "a": to10},
             {"q": f"Сколько останется от {b}, если взять {to10}?", "a": rest},
             {"q": f"Сколько будет 10 + {rest}?", "a": 10 + rest},
         ]
@@ -79,63 +61,64 @@ def build_addition_steps(text):
         {"q": f"Сколько будет {a} + {b}?", "a": a + b}
     ]
 
+# ================= VISION =================
 
-# =========================
-# OCR SAFE VERSION
-# =========================
-
-def safe_ocr(image_bytes):
-    if not OCR_AVAILABLE:
-        return "OCR не доступен (нет библиотек)"
-
-    try:
-        npimg = np.frombuffer(image_bytes, np.uint8)
-        img = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
-
-        if img is None:
-            return "Не удалось прочитать изображение"
-
-        pil_img = Image.fromarray(img)
-
-        # 🔥 если tesseract не в PATH — укажи вручную:
-        # pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-
-        text = pytesseract.image_to_string(pil_img)
-
-        if not text.strip():
-            return "Текст не распознан"
-
-        return text
-
-    except Exception as e:
-        return f"OCR ERROR: {str(e)}"
-
-
-# =========================
-# ROUTES
-# =========================
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-
-# -------- OCR --------
-@app.post("/api/ocr")
-async def ocr_image(file: UploadFile = File(...)):
+@app.post("/api/vision")
+async def vision_ocr(file: UploadFile = File(...)):
     try:
         contents = await file.read()
 
-        text = safe_ocr(contents)
+        # защита от огромных файлов
+        if len(contents) > 5_000_000:
+            return {"tasks": ["Фото слишком большое 📷"]}
 
-        # разбиваем грубо
-        tasks = [t.strip() for t in text.split("\n") if t.strip()]
+        base64_image = base64.b64encode(contents).decode("utf-8")
 
-        if not tasks:
-            tasks = [text]
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            response_format={"type": "json_object"},
+            messages=[
+                {
+                    "role": "system",
+                    "content": """
+Ты анализируешь фото страницы учебника (1–5 класс).
+
+Твоя задача:
+- Найти ВСЕ задачи на странице
+- Разделить их
+- Исправить ошибки распознавания
+- НЕ решать задачи
+
+Верни строго JSON:
+
+{
+  "tasks": [
+    "9 + 17",
+    "5 + 4",
+    "Ваня шел 12 минут..."
+  ]
+}
+"""
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Найди задачи на изображении"},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{base64_image}"
+                            }
+                        }
+                    ]
+                }
+            ]
+        )
+
+        data = json.loads(response.choices[0].message.content)
 
         return {
-            "tasks": tasks
+            "tasks": data.get("tasks", [])
         }
 
     except Exception as e:
@@ -144,21 +127,21 @@ async def ocr_image(file: UploadFile = File(...)):
             "error": str(e)
         }
 
+# ================= CHAT =================
 
-# -------- CHAT --------
 @app.post("/api/chat/message")
 def chat(data: ChatMessageRequest):
     user_id = data.user_id
     text = data.message.strip()
 
-    # === НОВАЯ ЗАДАЧА ===
+    # --- новая задача ---
     if user_id not in state_memory:
 
         if is_simple_addition(text):
             steps = build_addition_steps(text)
         else:
             return {
-                "reply": "Пока умею решать простые примеры 😊",
+                "reply": "Я пока помогаю с простыми примерами 😊",
                 "question": "",
                 "hint": "",
                 "emotion": "thinking"
@@ -189,7 +172,7 @@ def chat(data: ChatMessageRequest):
             "emotion": "thinking"
         }
 
-    # === ПРАВИЛЬНО ===
+    # --- правильно ---
     if user_num == step["a"]:
         state["step"] += 1
 
@@ -212,7 +195,7 @@ def chat(data: ChatMessageRequest):
             "emotion": "happy"
         }
 
-    # === НЕПРАВИЛЬНО ===
+    # --- ошибка ---
     return {
         "reply": "Попробуй ещё 🐾",
         "question": step["q"],
@@ -220,10 +203,16 @@ def chat(data: ChatMessageRequest):
         "emotion": "thinking"
     }
 
+# ================= SOLUTION =================
 
-# -------- SOLUTION --------
 @app.get("/api/solution")
 def solution():
     return {
-        "solution": "Решение скоро будет доступно 🐾"
+        "solution": "Скоро будет подробное решение 🐾"
     }
+
+# ================= HEALTH =================
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
