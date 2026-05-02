@@ -1,7 +1,12 @@
 import os
 import json
 import re
-from fastapi import FastAPI
+import cv2
+import numpy as np
+import pytesseract
+
+from PIL import Image
+from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
@@ -39,8 +44,7 @@ def is_new_problem(text: str):
     return (
         len(text) > 20 and
         any(w in t for w in [
-            "сколько", "во сколько", "найди",
-            "пошел", "встретились", "скорость"
+            "сколько", "найди", "во сколько", "шел", "минут"
         ])
     )
 
@@ -51,49 +55,36 @@ def extract_number(text: str):
 def is_help_request(text: str):
     t = text.lower()
     return any(w in t for w in [
-        "как", "почему", "объясни", "что значит",
-        "не понимаю", "как сделать"
+        "как", "почему", "объясни", "не понимаю"
     ])
 
 # ================= VISUAL EXPLAIN =================
 
 def detect_concept(text: str):
-    t = text.lower()
-    if "+" in t or "плюс" in t:
+    if "+" in text:
         return "addition"
-    if "-" in t or "минус" in t:
+    if "-" in text:
         return "subtraction"
     return "general"
 
-def visual_explain(concept, user_text):
-    if concept == "addition":
-        nums = re.findall(r'\d+', user_text)
-        if len(nums) >= 2:
-            a, b = int(nums[0]), int(nums[1])
+def visual_explain(concept, text):
+    nums = re.findall(r'\d+', text)
 
-            sticks_a = "|" * a
-            sticks_b = "|" * b
-
-            return f"""
+    if concept == "addition" and len(nums) >= 2:
+        a, b = int(nums[0]), int(nums[1])
+        return f"""
 Давай покажу на палочках 🐾
 
-{a} это:
-{sticks_a}
+{a}: {"|"*a}
+{b}: {"|"*b}
 
-{b} это:
-{sticks_b}
-
-Теперь сложим:
-
-{sticks_a} + {sticks_b}
-
-Посчитай все палочки 😊
+Теперь сложи все палочки 😊
 """
+
     return None
 
 def explain_concept(user_text, current_step, grade):
-    concept = detect_concept(user_text)
-    visual = visual_explain(concept, user_text)
+    visual = visual_explain(detect_concept(user_text), user_text)
 
     if visual:
         return {
@@ -103,7 +94,35 @@ def explain_concept(user_text, current_step, grade):
             "emotion": "thinking"
         }
 
-    # fallback GPT
+    return {
+        "reply": "Давай подумаем вместе 🐾",
+        "question": current_step,
+        "hint": "",
+        "emotion": "thinking"
+    }
+
+# ================= OCR =================
+
+def preprocess_image(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    thresh = cv2.adaptiveThreshold(
+        blur, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        11, 2
+    )
+
+    return thresh
+
+def clean_text(text: str):
+    text = text.replace("\n", " ")
+    text = re.sub(r'[^0-9а-яА-Яa-zA-Z\+\-\*/=.,() ]', '', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+def split_tasks_smart(text: str):
     try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -111,38 +130,44 @@ def explain_concept(user_text, current_step, grade):
             messages=[
                 {
                     "role": "system",
-                    "content": f"""
-Ты учитель {grade} класса.
+                    "content": """
+Раздели текст на задачи.
 
-Объясни просто и коротко.
-
-Верни к вопросу:
-{current_step}
-
-JSON:
-{{
-  "reply": "...",
-  "question": "...",
-  "hint": "...",
-  "emotion": "thinking"
-}}
+Верни JSON:
+{
+  "tasks": ["..."]
+}
 """
                 },
-                {"role": "user", "content": user_text}
+                {"role": "user", "content": text}
             ]
         )
 
-        return json.loads(response.choices[0].message.content)
+        return json.loads(response.choices[0].message.content)["tasks"]
 
-    except Exception:
-        return {
-            "reply": "Давай подумаем вместе 🐾",
-            "question": current_step,
-            "hint": "",
-            "emotion": "thinking"
-        }
+    except:
+        return [text]
 
 # ================= STEP GENERATION =================
+
+def is_simple_addition(text: str):
+    return re.match(r'^\d+\s*\+\s*\d+$', text.strip())
+
+def build_addition_steps(text):
+    a, b = map(int, re.findall(r'\d+', text))
+    to10 = 10 - a
+
+    if b > to10:
+        rest = b - to10
+        return [
+            {"question": f"Сколько нужно добавить к {a}, чтобы было 10?", "answer": to10},
+            {"question": f"Сколько осталось от {b}?", "answer": rest},
+            {"question": f"Сколько будет 10 + {rest}?", "answer": 10 + rest},
+        ]
+
+    return [
+        {"question": f"Сколько будет {a} + {b}?", "answer": a + b}
+    ]
 
 def generate_steps(problem, grade):
     try:
@@ -152,16 +177,15 @@ def generate_steps(problem, grade):
             messages=[
                 {
                     "role": "system",
-                    "content": f"""
-Разбей задачу для {grade} класса на шаги.
+                    "content": """
+Разбей задачу на шаги.
 
 Формат:
-{{
+{
   "steps": [
-    {{ "question": "...", "answer": 36 }},
-    {{ "question": "...", "answer": 5 }}
+    {"question": "...", "answer": 5}
   ]
-}}
+}
 """
                 },
                 {"role": "user", "content": problem}
@@ -170,54 +194,8 @@ def generate_steps(problem, grade):
 
         return json.loads(response.choices[0].message.content)["steps"]
 
-    except Exception:
+    except:
         return [{"question": "Попробуй понять задачу", "answer": 0}]
-
-# ================= ERROR EXPLAIN =================
-
-def explain_error(step, user_text, correct_value, grade):
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            response_format={"type": "json_object"},
-            messages=[
-                {
-                    "role": "system",
-                    "content": f"""
-Ты учитель {grade} класса.
-
-Шаг:
-{step}
-
-Ответ ученика:
-{user_text}
-
-Правильный ответ:
-{correct_value}
-
-Объясни ошибку кратко.
-
-JSON:
-{{
-  "reply": "...",
-  "question": "...",
-  "hint": "...",
-  "emotion": "thinking"
-}}
-"""
-                }
-            ]
-        )
-
-        return json.loads(response.choices[0].message.content)
-
-    except Exception:
-        return {
-            "reply": "Давай попробуем ещё раз 🐾",
-            "question": step,
-            "hint": "",
-            "emotion": "thinking"
-        }
 
 # ================= ROUTES =================
 
@@ -225,58 +203,74 @@ JSON:
 def health():
     return {"status": "ok"}
 
+# ---------- OCR ----------
+@app.post("/api/ocr")
+async def ocr_image(file: UploadFile = File(...)):
+    contents = await file.read()
+
+    npimg = np.frombuffer(contents, np.uint8)
+    img = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
+
+    processed = preprocess_image(img)
+
+    pil_img = Image.fromarray(processed)
+
+    raw_text = pytesseract.image_to_string(pil_img, lang="rus+eng")
+    cleaned = clean_text(raw_text)
+    tasks = split_tasks_smart(cleaned)
+
+    return {
+        "tasks": tasks
+    }
+
+# ---------- CHAT ----------
 @app.post("/api/chat/message")
 def chat(data: ChatMessageRequest):
     user_id = data.user_id
     text = data.message.strip()
 
-    # ===== NEW PROBLEM =====
+    # NEW PROBLEM
     if user_id not in state_memory or is_new_problem(text):
 
-        steps = generate_steps(text, data.grade)
+        if is_simple_addition(text):
+            steps = build_addition_steps(text)
+        else:
+            steps = generate_steps(text, data.grade)
 
         state_memory[user_id] = {
             "steps": steps,
-            "current_step": 0,
-            "last_question": None
+            "current_step": 0
         }
-
-        first_q = steps[0]["question"]
-        state_memory[user_id]["last_question"] = first_q
 
         return {
             "reply": "Давай решим вместе 🐾",
-            "question": first_q,
+            "question": steps[0]["question"],
             "hint": "",
             "emotion": "thinking"
         }
 
     state = state_memory[user_id]
-    step_data = state["steps"][state["current_step"]]
+    step = state["steps"][state["current_step"]]
 
-    # ===== HELP REQUEST =====
+    # HELP
     if is_help_request(text):
         return explain_concept(
             user_text=text,
-            current_step=step_data["question"],
+            current_step=step["question"],
             grade=data.grade
         )
 
-    # ===== ANSWER CHECK =====
     user_number = extract_number(text)
 
     if user_number is None:
         return {
             "reply": "Ответь числом 😊",
-            "question": step_data["question"],
+            "question": step["question"],
             "hint": "",
             "emotion": "thinking"
         }
 
-    correct = step_data["answer"]
-
-    # ===== CORRECT =====
-    if user_number == correct:
+    if user_number == step["answer"]:
         state["current_step"] += 1
 
         if state["current_step"] >= len(state["steps"]):
@@ -287,26 +281,23 @@ def chat(data: ChatMessageRequest):
                 "emotion": "proud"
             }
 
-        next_q = state["steps"][state["current_step"]]["question"]
-
-        if next_q == state["last_question"]:
-            state["current_step"] += 1
-            if state["current_step"] < len(state["steps"]):
-                next_q = state["steps"][state["current_step"]]["question"]
-
-        state["last_question"] = next_q
+        next_step = state["steps"][state["current_step"]]
 
         return {
             "reply": "Верно 👍",
-            "question": next_q,
+            "question": next_step["question"],
             "hint": "",
             "emotion": "happy"
         }
 
-    # ===== ERROR =====
-    return explain_error(
-        step=step_data["question"],
-        user_text=text,
-        correct_value=correct,
-        grade=data.grade
-    )
+    return {
+        "reply": "Попробуй ещё 🐾",
+        "question": step["question"],
+        "hint": "",
+        "emotion": "thinking"
+    }
+
+# ---------- SOLUTION ----------
+@app.get("/api/solution")
+def solution():
+    return {"solution": "Решение пока в разработке 🐾"}
