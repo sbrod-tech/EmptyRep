@@ -1,18 +1,29 @@
 import os
 import json
 import re
-import cv2
 import numpy as np
-import pytesseract
 
-from PIL import Image
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+# --- OCR libs ---
+try:
+    import cv2
+    from PIL import Image
+    import pytesseract
+
+    OCR_AVAILABLE = True
+except Exception as e:
+    print("OCR INIT ERROR:", e)
+    OCR_AVAILABLE = False
+
+# --- OpenAI ---
 from openai import OpenAI
 
-# ================= INIT =================
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+# --- INIT APP ---
 app = FastAPI(title="Murmatika API 🐾")
 
 app.add_middleware(
@@ -23,257 +34,168 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-# ================= MEMORY =================
-
+# --- MEMORY ---
 state_memory = {}
 
-# ================= MODELS =================
-
+# --- MODELS ---
 class ChatMessageRequest(BaseModel):
     name: str
     grade: int
     message: str
     user_id: str
 
-# ================= UTILS =================
 
-def is_new_problem(text: str):
-    t = text.lower()
-    return (
-        len(text) > 20 and
-        any(w in t for w in [
-            "сколько", "найди", "во сколько", "шел", "минут"
-        ])
-    )
+# =========================
+# UTILS
+# =========================
 
 def extract_number(text: str):
     nums = re.findall(r'\d+', text)
     return int(nums[-1]) if nums else None
 
-def is_help_request(text: str):
-    t = text.lower()
-    return any(w in t for w in [
-        "как", "почему", "объясни", "не понимаю"
-    ])
-
-# ================= VISUAL EXPLAIN =================
-
-def detect_concept(text: str):
-    if "+" in text:
-        return "addition"
-    if "-" in text:
-        return "subtraction"
-    return "general"
-
-def visual_explain(concept, text):
-    nums = re.findall(r'\d+', text)
-
-    if concept == "addition" and len(nums) >= 2:
-        a, b = int(nums[0]), int(nums[1])
-        return f"""
-Давай покажу на палочках 🐾
-
-{a}: {"|"*a}
-{b}: {"|"*b}
-
-Теперь сложи все палочки 😊
-"""
-
-    return None
-
-def explain_concept(user_text, current_step, grade):
-    visual = visual_explain(detect_concept(user_text), user_text)
-
-    if visual:
-        return {
-            "reply": visual.strip(),
-            "question": current_step,
-            "hint": "Попробуй теперь сам 😊",
-            "emotion": "thinking"
-        }
-
-    return {
-        "reply": "Давай подумаем вместе 🐾",
-        "question": current_step,
-        "hint": "",
-        "emotion": "thinking"
-    }
-
-# ================= OCR =================
-
-def preprocess_image(img):
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-
-    thresh = cv2.adaptiveThreshold(
-        blur, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        11, 2
-    )
-
-    return thresh
-
-def clean_text(text: str):
-    text = text.replace("\n", " ")
-    text = re.sub(r'[^0-9а-яА-Яa-zA-Z\+\-\*/=.,() ]', '', text)
-    text = re.sub(r'\s+', ' ', text)
-    return text.strip()
-
-def split_tasks_smart(text: str):
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            response_format={"type": "json_object"},
-            messages=[
-                {
-                    "role": "system",
-                    "content": """
-Раздели текст на задачи.
-
-Верни JSON:
-{
-  "tasks": ["..."]
-}
-"""
-                },
-                {"role": "user", "content": text}
-            ]
-        )
-
-        return json.loads(response.choices[0].message.content)["tasks"]
-
-    except:
-        return [text]
-
-# ================= STEP GENERATION =================
 
 def is_simple_addition(text: str):
     return re.match(r'^\d+\s*\+\s*\d+$', text.strip())
 
+
+# =========================
+# STEP ENGINE (без GPT)
+# =========================
+
 def build_addition_steps(text):
     a, b = map(int, re.findall(r'\d+', text))
+
     to10 = 10 - a
 
     if b > to10:
         rest = b - to10
         return [
-            {"question": f"Сколько нужно добавить к {a}, чтобы было 10?", "answer": to10},
-            {"question": f"Сколько осталось от {b}?", "answer": rest},
-            {"question": f"Сколько будет 10 + {rest}?", "answer": 10 + rest},
+            {"q": f"Сколько нужно добавить к {a}, чтобы получить 10?", "a": to10},
+            {"q": f"Сколько останется от {b}, если взять {to10}?", "a": rest},
+            {"q": f"Сколько будет 10 + {rest}?", "a": 10 + rest},
         ]
 
     return [
-        {"question": f"Сколько будет {a} + {b}?", "answer": a + b}
+        {"q": f"Сколько будет {a} + {b}?", "a": a + b}
     ]
 
-def generate_steps(problem, grade):
+
+# =========================
+# OCR SAFE VERSION
+# =========================
+
+def safe_ocr(image_bytes):
+    if not OCR_AVAILABLE:
+        return "OCR не доступен (нет библиотек)"
+
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            response_format={"type": "json_object"},
-            messages=[
-                {
-                    "role": "system",
-                    "content": """
-Разбей задачу на шаги.
+        npimg = np.frombuffer(image_bytes, np.uint8)
+        img = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
 
-Формат:
-{
-  "steps": [
-    {"question": "...", "answer": 5}
-  ]
-}
-"""
-                },
-                {"role": "user", "content": problem}
-            ]
-        )
+        if img is None:
+            return "Не удалось прочитать изображение"
 
-        return json.loads(response.choices[0].message.content)["steps"]
+        pil_img = Image.fromarray(img)
 
-    except:
-        return [{"question": "Попробуй понять задачу", "answer": 0}]
+        # 🔥 если tesseract не в PATH — укажи вручную:
+        # pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
-# ================= ROUTES =================
+        text = pytesseract.image_to_string(pil_img)
+
+        if not text.strip():
+            return "Текст не распознан"
+
+        return text
+
+    except Exception as e:
+        return f"OCR ERROR: {str(e)}"
+
+
+# =========================
+# ROUTES
+# =========================
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-# ---------- OCR ----------
+
+# -------- OCR --------
 @app.post("/api/ocr")
 async def ocr_image(file: UploadFile = File(...)):
-    contents = await file.read()
+    try:
+        contents = await file.read()
 
-    npimg = np.frombuffer(contents, np.uint8)
-    img = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
+        text = safe_ocr(contents)
 
-    processed = preprocess_image(img)
+        # разбиваем грубо
+        tasks = [t.strip() for t in text.split("\n") if t.strip()]
 
-    pil_img = Image.fromarray(processed)
+        if not tasks:
+            tasks = [text]
 
-    raw_text = pytesseract.image_to_string(pil_img, lang="rus+eng")
-    cleaned = clean_text(raw_text)
-    tasks = split_tasks_smart(cleaned)
+        return {
+            "tasks": tasks
+        }
 
-    return {
-        "tasks": tasks
-    }
+    except Exception as e:
+        return {
+            "tasks": [],
+            "error": str(e)
+        }
 
-# ---------- CHAT ----------
+
+# -------- CHAT --------
 @app.post("/api/chat/message")
 def chat(data: ChatMessageRequest):
     user_id = data.user_id
     text = data.message.strip()
 
-    # NEW PROBLEM
-    if user_id not in state_memory or is_new_problem(text):
+    # === НОВАЯ ЗАДАЧА ===
+    if user_id not in state_memory:
 
         if is_simple_addition(text):
             steps = build_addition_steps(text)
         else:
-            steps = generate_steps(text, data.grade)
+            return {
+                "reply": "Пока умею решать простые примеры 😊",
+                "question": "",
+                "hint": "",
+                "emotion": "thinking"
+            }
 
         state_memory[user_id] = {
             "steps": steps,
-            "current_step": 0
+            "step": 0
         }
 
         return {
             "reply": "Давай решим вместе 🐾",
-            "question": steps[0]["question"],
+            "question": steps[0]["q"],
             "hint": "",
             "emotion": "thinking"
         }
 
     state = state_memory[user_id]
-    step = state["steps"][state["current_step"]]
+    step = state["steps"][state["step"]]
 
-    # HELP
-    if is_help_request(text):
-        return explain_concept(
-            user_text=text,
-            current_step=step["question"],
-            grade=data.grade
-        )
+    user_num = extract_number(text)
 
-    user_number = extract_number(text)
-
-    if user_number is None:
+    if user_num is None:
         return {
-            "reply": "Ответь числом 😊",
-            "question": step["question"],
+            "reply": "Напиши число 😊",
+            "question": step["q"],
             "hint": "",
             "emotion": "thinking"
         }
 
-    if user_number == step["answer"]:
-        state["current_step"] += 1
+    # === ПРАВИЛЬНО ===
+    if user_num == step["a"]:
+        state["step"] += 1
 
-        if state["current_step"] >= len(state["steps"]):
+        if state["step"] >= len(state["steps"]):
+            state_memory.pop(user_id)
+
             return {
                 "reply": "Отлично! 🎉",
                 "question": "",
@@ -281,23 +203,27 @@ def chat(data: ChatMessageRequest):
                 "emotion": "proud"
             }
 
-        next_step = state["steps"][state["current_step"]]
+        next_step = state["steps"][state["step"]]
 
         return {
             "reply": "Верно 👍",
-            "question": next_step["question"],
+            "question": next_step["q"],
             "hint": "",
             "emotion": "happy"
         }
 
+    # === НЕПРАВИЛЬНО ===
     return {
         "reply": "Попробуй ещё 🐾",
-        "question": step["question"],
+        "question": step["q"],
         "hint": "",
         "emotion": "thinking"
     }
 
-# ---------- SOLUTION ----------
+
+# -------- SOLUTION --------
 @app.get("/api/solution")
 def solution():
-    return {"solution": "Решение пока в разработке 🐾"}
+    return {
+        "solution": "Решение скоро будет доступно 🐾"
+    }
