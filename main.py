@@ -40,30 +40,9 @@ def extract_number(text: str):
     nums = re.findall(r'\d+', text)
     return int(nums[-1]) if nums else None
 
-def is_simple_addition(text: str):
-    return re.match(r'^\d+\s*\+\s*\d+$', text.strip())
+# ================= SOLVER =================
 
-# ================= STEP ENGINE =================
-
-def build_addition_steps(text):
-    a, b = map(int, re.findall(r'\d+', text))
-    to10 = 10 - a
-
-    if b > to10:
-        rest = b - to10
-        return [
-            {"q": f"Сколько нужно добавить к {a}, чтобы получилось 10?", "a": to10},
-            {"q": f"Сколько останется от {b}, если взять {to10}?", "a": rest},
-            {"q": f"Сколько будет 10 + {rest}?", "a": 10 + rest},
-        ]
-
-    return [
-        {"q": f"Сколько будет {a} + {b}?", "a": a + b}
-    ]
-
-# ================= FULL SOLUTION =================
-
-def generate_full_solution(problem: str):
+def solve_problem(problem: str):
     try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -74,12 +53,18 @@ def generate_full_solution(problem: str):
                     "content": """
 Ты учитель начальных классов.
 
-Реши задачу полностью и понятно для ребёнка.
+Реши задачу полностью.
 
 Верни JSON:
+
 {
-  "solution": "пошаговое решение простым языком",
-  "answer": 26
+  "answer": 26,
+  "steps": [
+    "разложим 17 на 10 и 7",
+    "9 + 10 = 19",
+    "19 + 7 = 26"
+  ],
+  "strategy": "через десяток"
 }
 """
                 },
@@ -87,11 +72,15 @@ def generate_full_solution(problem: str):
             ]
         )
 
-        data = json.loads(response.choices[0].message.content)
-        return data.get("solution", "Нет решения")
+        return json.loads(response.choices[0].message.content)
 
     except Exception as e:
-        return f"Ошибка решения: {str(e)}"
+        return {
+            "answer": None,
+            "steps": [],
+            "strategy": "unknown",
+            "error": str(e)
+        }
 
 # ================= VISION =================
 
@@ -156,68 +145,67 @@ def chat(data: ChatMessageRequest):
     user_id = data.user_id
     text = data.message.strip()
 
-    # --- новая задача ---
+    # ===== НОВАЯ ЗАДАЧА =====
     if user_id not in state_memory:
 
-        if is_simple_addition(text):
-            steps = build_addition_steps(text)
-            solution = f"{text} = {steps[-1]['a']}"
-        else:
-            steps = [{"q": "Пока решаем простые примеры 😊", "a": 0}]
-            solution = generate_full_solution(text)
+        solution_data = solve_problem(text)
+
+        answer = solution_data.get("answer")
+        steps = solution_data.get("steps", [])
+        strategy = solution_data.get("strategy", "")
+
+        if not steps:
+            steps = [f"Сколько будет {text}?"]
 
         state_memory[user_id] = {
+            "answer": answer,
             "steps": steps,
             "step": 0,
-            "solution": solution
+            "strategy": strategy,
+            "solution": "\n".join(steps)
         }
 
         return {
-            "reply": "Давай решим вместе 🐾",
-            "question": steps[0]["q"],
-            "hint": "",
+            "reply": "Давай разберём вместе 🐾",
+            "question": steps[0],
+            "hint": f"Попробуй через: {strategy}",
             "emotion": "thinking"
         }
 
+    # ===== ПРОДОЛЖЕНИЕ =====
     state = state_memory[user_id]
-    step = state["steps"][state["step"]]
 
+    correct_answer = state["answer"]
     user_num = extract_number(text)
 
     if user_num is None:
         return {
             "reply": "Напиши число 😊",
-            "question": step["q"],
+            "question": state["steps"][state["step"]],
             "hint": "",
             "emotion": "thinking"
         }
 
-    if user_num == step["a"]:
-        state["step"] += 1
-
-        if state["step"] >= len(state["steps"]):
-            state_memory.pop(user_id)
-
-            return {
-                "reply": "Отлично! 🎉",
-                "question": "",
-                "hint": "",
-                "emotion": "proud"
-            }
-
-        next_step = state["steps"][state["step"]]
+    # ===== ПРАВИЛЬНЫЙ ОТВЕТ =====
+    if user_num == correct_answer:
+        state_memory.pop(user_id)
 
         return {
-            "reply": "Верно 👍",
-            "question": next_step["q"],
+            "reply": "Супер! Ты решил задачу 🎉",
+            "question": "",
             "hint": "",
-            "emotion": "happy"
+            "emotion": "proud"
         }
 
+    # ===== ПОДСКАЗКА ПО ШАГАМ =====
+    current_step = state["steps"][state["step"]]
+
+    state["step"] = min(state["step"] + 1, len(state["steps"]) - 1)
+
     return {
-        "reply": "Попробуй ещё 🐾",
-        "question": step["q"],
-        "hint": "",
+        "reply": "Попробуй так 👇",
+        "question": current_step,
+        "hint": f"Стратегия: {state['strategy']}",
         "emotion": "thinking"
     }
 
@@ -231,6 +219,15 @@ def solution(user_id: str = Query(...)):
         return {"solution": "Сначала выбери задачу 😊"}
 
     return {"solution": state.get("solution", "Нет решения")}
+
+# ================= RESET =================
+
+@app.delete("/api/reset")
+def reset(user_id: str):
+    if user_id in state_memory:
+        state_memory.pop(user_id)
+
+    return {"status": "reset"}
 
 # ================= HEALTH =================
 
