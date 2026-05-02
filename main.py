@@ -22,8 +22,6 @@ app.add_middleware(
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# ================= MEMORY =================
-
 state_memory = {}
 
 # ================= MODELS =================
@@ -40,152 +38,147 @@ def extract_number(text: str):
     nums = re.findall(r'\d+(?:\.\d+)?', text)
     return float(nums[-1]) if nums else None
 
+def is_help(text: str):
+    text = text.lower()
+    return any(w in text for w in [
+        "не понимаю", "непонятно", "как", "помоги", "объясни"
+    ])
+
 # ================= SOLVER =================
 
 def solve_problem(problem: str):
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            response_format={"type": "json_object"},
-            messages=[
-                {
-                    "role": "system",
-                    "content": """
-Ты учитель младших классов.
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        response_format={"type": "json_object"},
+        messages=[
+            {
+                "role": "system",
+                "content": """
+Ты учитель начальных классов.
 
-Реши задачу, НО НЕ объясняй её ученику.
+Реши задачу ТОЛЬКО ДЛЯ СЕБЯ.
+Создай план обучения.
 
-Также создай обучающие вопросы.
+НЕ объясняй решение напрямую.
 
 Верни JSON:
 
 {
   "answer": 26,
-  "steps": ["..."],
+  "steps": ["9+10=19", "19+7=26"],
   "questions": [
     "Что известно в задаче?",
     "Что нужно найти?",
     "Какое действие подойдёт?"
   ],
-  "strategy": "сложение / деление / логика"
+  "strategy": "сложение"
 }
 """
-                },
-                {"role": "user", "content": problem}
-            ]
-        )
+            },
+            {"role": "user", "content": problem}
+        ]
+    )
 
-        return json.loads(response.choices[0].message.content)
+    return json.loads(response.choices[0].message.content)
 
-    except Exception as e:
-        return {
-            "answer": None,
-            "steps": [],
-            "questions": ["Давай разберём задачу 😊"],
-            "strategy": "unknown",
-            "error": str(e)
-        }
+# ================= HELP EXPLAIN =================
+
+def explain_step(state):
+    current_q = state["questions"][state["step"]]
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        response_format={"type": "json_object"},
+        messages=[
+            {
+                "role": "system",
+                "content": """
+Ты учитель 1-5 класса.
+
+Объясни ТОЛЬКО текущий шаг.
+
+СТРОГО:
+- не решай задачу
+- не давай финальный ответ
+- не меняй задачу
+- объясняй просто
+
+Верни JSON:
+
+{
+  "explain": "...",
+  "hint": "..."
+}
+"""
+            },
+            {
+                "role": "user",
+                "content": f"""
+Задача:
+{state["problem"]}
+
+Текущий шаг:
+{current_q}
+"""
+            }
+        ]
+    )
+
+    data = json.loads(response.choices[0].message.content)
+
+    return {
+        "reply": data["explain"],
+        "question": current_q,
+        "hint": data["hint"],
+        "emotion": "thinking"
+    }
 
 # ================= ANALYZE =================
 
-def analyze_step(problem, user_input, correct_answer, steps):
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            response_format={"type": "json_object"},
-            messages=[
-                {
-                    "role": "system",
-                    "content": """
+def analyze_answer(state, user_text):
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        response_format={"type": "json_object"},
+        messages=[
+            {
+                "role": "system",
+                "content": """
 Ты учитель младших классов.
 
 Проанализируй ответ ученика.
 
-ВАЖНО:
-- не говори сразу правильный ответ
-- оцени ход мысли
-- дай мягкую подсказку
+СТРОГО:
+- не давай правильный ответ
+- оцени мышление
+- если почти верно → поддержи
+- если ошибка → мягко направь
 
 Верни JSON:
 
 {
-  "is_correct": true/false,
-  "feedback": "объяснение",
-  "next_hint": "подсказка"
+  "correct": true/false,
+  "feedback": "...",
+  "hint": "..."
 }
 """
-                },
-                {
-                    "role": "user",
-                    "content": f"""
-Задача: {problem}
+            },
+            {
+                "role": "user",
+                "content": f"""
+Задача:
+{state["problem"]}
 
-Правильный ответ: {correct_answer}
-
-Решение:
-{steps}
+Правильный ответ:
+{state["answer"]}
 
 Ответ ученика:
-{user_input}
+{user_text}
 """
-                }
-            ]
-        )
+            }
+        ]
+    )
 
-        return json.loads(response.choices[0].message.content)
-
-    except Exception:
-        return {
-            "is_correct": False,
-            "feedback": "Давай подумаем ещё 😊",
-            "next_hint": ""
-        }
-
-# ================= VISION =================
-
-@app.post("/api/vision")
-async def vision(file: UploadFile = File(...)):
-    try:
-        contents = await file.read()
-        base64_image = base64.b64encode(contents).decode("utf-8")
-
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            response_format={"type": "json_object"},
-            messages=[
-                {
-                    "role": "system",
-                    "content": """
-Найди задачи на изображении.
-
-НЕ решай.
-
-Верни JSON:
-{
-  "tasks": ["..."]
-}
-"""
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "Найди задачи"},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{base64_image}"
-                            }
-                        }
-                    ]
-                }
-            ]
-        )
-
-        data = json.loads(response.choices[0].message.content)
-        return {"tasks": data.get("tasks", [])}
-
-    except Exception as e:
-        return {"tasks": [], "error": str(e)}
+    return json.loads(response.choices[0].message.content)
 
 # ================= CHAT =================
 
@@ -201,50 +194,49 @@ def chat(data: ChatMessageRequest):
 
         state_memory[user_id] = {
             "problem": text,
-            "answer": solution.get("answer"),
-            "steps": solution.get("steps", []),
-            "questions": solution.get("questions", []),
-            "strategy": solution.get("strategy", ""),
+            "answer": solution["answer"],
+            "steps": solution["steps"],
+            "questions": solution["questions"],
+            "strategy": solution["strategy"],
             "step": 0
         }
 
         return {
             "reply": "Давай разберём вместе 🐾",
-            "question": state_memory[user_id]["questions"][0],
-            "hint": f"Подумай: {solution.get('strategy')}",
+            "question": solution["questions"][0],
+            "hint": f"Подумай: {solution['strategy']}",
             "emotion": "thinking"
         }
 
-    # ===== ПРОДОЛЖЕНИЕ =====
     state = state_memory[user_id]
 
-    analysis = analyze_step(
-        state["problem"],
-        text,
-        state["answer"],
-        state["steps"]
-    )
+    # ===== HELP =====
+    if is_help(text):
+        return explain_step(state)
 
-    # ===== ЕСЛИ ПРАВИЛЬНО =====
-    if analysis["is_correct"]:
-        state_memory.pop(user_id)
+    # ===== ЧИСЛО =====
+    user_num = extract_number(text)
 
-        return {
-            "reply": "Отлично! 🎉 " + analysis["feedback"],
-            "question": "",
-            "hint": "",
-            "emotion": "proud"
-        }
+    if user_num is not None:
+        if abs(user_num - state["answer"]) < 0.001:
+            state_memory.pop(user_id)
+            return {
+                "reply": "Отлично! 🎉 Ты решил задачу!",
+                "question": "",
+                "hint": "",
+                "emotion": "proud"
+            }
 
-    # ===== ЕСЛИ ОШИБКА =====
-    questions = state["questions"]
+    # ===== АНАЛИЗ =====
+    analysis = analyze_answer(state, text)
 
-    state["step"] = min(state["step"] + 1, len(questions) - 1)
+    # продвигаем шаг ТОЛЬКО тут
+    state["step"] = min(state["step"] + 1, len(state["questions"]) - 1)
 
     return {
         "reply": analysis["feedback"],
-        "question": questions[state["step"]],
-        "hint": analysis["next_hint"],
+        "question": state["questions"][state["step"]],
+        "hint": analysis["hint"],
         "emotion": "thinking"
     }
 
@@ -257,9 +249,7 @@ def get_solution(user_id: str = Query(...)):
     if not state:
         return {"solution": "Нет активной задачи"}
 
-    return {
-        "solution": "\n".join(state.get("steps", []))
-    }
+    return {"solution": "\n".join(state["steps"])}
 
 # ================= RESET =================
 
@@ -267,6 +257,47 @@ def get_solution(user_id: str = Query(...)):
 def reset(user_id: str):
     state_memory.pop(user_id, None)
     return {"status": "reset"}
+
+# ================= VISION =================
+
+@app.post("/api/vision")
+async def vision(file: UploadFile = File(...)):
+    contents = await file.read()
+    base64_image = base64.b64encode(contents).decode("utf-8")
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        response_format={"type": "json_object"},
+        messages=[
+            {
+                "role": "system",
+                "content": """
+Найди задачи на изображении.
+НЕ решай.
+
+Верни JSON:
+{
+  "tasks": ["..."]
+}
+"""
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Найди задачи"},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{base64_image}"
+                        }
+                    }
+                ]
+            }
+        ]
+    )
+
+    data = json.loads(response.choices[0].message.content)
+    return {"tasks": data.get("tasks", [])}
 
 # ================= HEALTH =================
 
