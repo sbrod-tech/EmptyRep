@@ -263,3 +263,52 @@ async def generate(req: TaskRequest):
                 }
             ]
         }
+    # =========================
+# ✅ CHECK ANSWER
+# =========================
+class CheckAnswerRequest(BaseModel):
+    user_answer: str
+    correct_answer: str
+
+
+def normalize_answer(text: str):
+    text = text.lower().strip()
+    text = re.sub(r'[^0-9\.\-]', '', text)
+    return text
+
+
+@app.post("/api/check_answer")
+async def check_answer(req: CheckAnswerRequest):
+    try:
+        user = normalize_answer(req.user_answer)
+        correct = normalize_answer(req.correct_answer)
+
+        if user == correct:
+            return {"correct": True}
+
+        # fallback через GPT
+        res = client.chat.completions.create(
+            model="gpt-4o-mini",
+            response_format={"type": "json_object"},
+            messages=[{
+                "role": "user",
+                "content": f"""
+Проверь равны ли ответы.
+
+Ответ ученика: {req.user_answer}
+Правильный ответ: {req.correct_answer}
+
+Игнорируй единицы измерения.
+
+Верни:
+{{"correct": true/false}}
+"""
+            }]
+        )
+
+        data = json.loads(res.choices[0].message.content)
+
+        return {"correct": data.get("correct", False)}
+
+    except Exception:
+        return {"correct": False}
