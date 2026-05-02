@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import base64
 import json
+import re
 from openai import OpenAI
 
 app = FastAPI()
@@ -43,7 +44,45 @@ def root():
 
 
 # =========================
-# 📸 OCR (Vision)
+# 🧹 ОЧИСТКА ТЕКСТА
+# =========================
+def clean_text(text: str):
+    text = text.replace('\r', '\n')
+    text = re.sub(r'\n+', '\n', text)
+    text = re.sub(r'\.{3,}', ' ', text)  # убираем "..."
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+
+# =========================
+# ✂️ УМНЫЙ SPLIT
+# =========================
+def split_tasks_smart(text: str):
+    matches = list(re.finditer(r'(?<!\d)(\d{2,3})[\.\)]?\s', text))
+
+    if not matches:
+        return [text]
+
+    tasks = []
+
+    for i in range(len(matches)):
+        start = matches[i].start()
+
+        if i + 1 < len(matches):
+            end = matches[i + 1].start()
+        else:
+            end = len(text)
+
+        task = text[start:end].strip()
+
+        if len(task) > 20:
+            tasks.append(task)
+
+    return tasks
+
+
+# =========================
+# 📸 OCR (УЛУЧШЕННЫЙ)
 # =========================
 @app.post("/api/vision")
 async def vision(file: UploadFile = File(...)):
@@ -52,12 +91,26 @@ async def vision(file: UploadFile = File(...)):
         base64_image = base64.b64encode(image_bytes).decode()
 
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4o",
             messages=[
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": "Распознай текст задачи"},
+                        {
+                            "type": "text",
+                            "text": """
+Распознай ВЕСЬ текст на изображении.
+
+ПРАВИЛА:
+- НЕ сокращай
+- НЕ пересказывай
+- НЕ убирай слова
+- СОХРАНИ порядок
+- СОХРАНИ числа и единицы
+
+Верни только текст.
+"""
+                        },
                         {
                             "type": "image_url",
                             "image_url": {
@@ -69,45 +122,26 @@ async def vision(file: UploadFile = File(...)):
             ],
         )
 
-        text = response.choices[0].message.content
+        text = response.choices[0].message.content or ""
 
         return {"text": text}
 
-    except Exception as e:
+    except Exception:
         return {"text": ""}
 
 
 # =========================
-# ✂️ SPLIT задач
+# ✂️ SPLIT API
 # =========================
 @app.post("/api/split")
 async def split(req: TextRequest):
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            response_format={"type": "json_object"},
-            messages=[
-                {
-                    "role": "user",
-                    "content": f"""
-Раздели текст на отдельные задачи.
+        text = clean_text(req.text)
+        tasks = split_tasks_smart(text)
 
-Верни JSON:
-{{ "tasks": ["...", "..."] }}
+        return {"tasks": tasks}
 
-Текст:
-{req.text}
-""",
-                }
-            ],
-        )
-
-        raw = response.choices[0].message.content
-        data = json.loads(raw)
-
-        return {"tasks": data.get("tasks", [])}
-
-    except Exception as e:
+    except Exception:
         return {"tasks": [req.text]}
 
 
@@ -128,13 +162,11 @@ async def generate(req: TaskRequest):
 
 Разбей задачу на шаги.
 
-ВАЖНО:
-- НЕ давай ответ сразу
-- веди через вопросы
-- каждый шаг:
-  - question (вопрос)
-  - answer (правильный ответ)
-  - hint (подсказка)
+ПРАВИЛА:
+- НЕ давай сразу ответ
+- веди ребёнка через вопросы
+- шаги простые
+- без сложных формулировок
 
 Верни JSON:
 
@@ -150,7 +182,7 @@ async def generate(req: TaskRequest):
 
 Задача:
 {req.task}
-""",
+"""
                 }
             ],
         )
@@ -160,13 +192,13 @@ async def generate(req: TaskRequest):
 
         return data
 
-    except Exception as e:
+    except Exception:
         return {
             "steps": [
                 {
                     "question": "Не удалось разобрать задачу 😢",
                     "answer": "",
-                    "hint": "Попробуй перефотографировать"
+                    "hint": "Попробуй ещё раз"
                 }
             ]
         }
