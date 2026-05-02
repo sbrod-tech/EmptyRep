@@ -27,7 +27,7 @@ def health():
 
 
 # =========================
-# 📸 OCR
+# 📸 OCR (ТЕПЕРЬ БЕЗ РЕЗКИ)
 # =========================
 @app.post("/api/vision")
 async def vision(file: UploadFile = File(...)):
@@ -41,8 +41,27 @@ async def vision(file: UploadFile = File(...)):
             messages=[{
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": "Верни json {\"tasks\": []} извлеки задачи"},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
+                    {
+                        "type": "text",
+                        "text": """
+Перепиши ВЕСЬ текст с изображения БЕЗ изменений.
+
+Правила:
+- не сокращай
+- не интерпретируй
+- не дели
+- сохрани номера задач
+
+Верни строго JSON:
+{
+  "text": "..."
+}
+"""
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
+                    }
                 ]
             }]
         )
@@ -50,53 +69,87 @@ async def vision(file: UploadFile = File(...)):
         raw = response.choices[0].message.content
         data = json.loads(raw)
 
-        tasks = data.get("tasks", [])
+        full_text = data.get("text", "")
 
-        clean = []
-
-        for t in tasks:
-            if isinstance(t, dict):
-                val = t.get("task", "")
-            else:
-                val = t
-
-            # всегда строка
-            val = str(val).strip()
-
-            if val:
-                clean.append(val)
-
-        return {"tasks": clean or ["Не удалось распознать задачу"]}
+        return {"text": full_text or "Не удалось распознать текст"}
 
     except Exception as e:
         print("VISION ERROR:", e)
-        return {"tasks": ["Ошибка распознавания"]}
+        return {"text": "Ошибка распознавания"}
 
 
 # =========================
-# 🔢 НОРМАЛИЗАЦИЯ
+# ✂️ SPLIT ЗАДАЧ
 # =========================
-def normalize_number(text):
-    text = text.lower().replace(",", ".")
-    match = re.findall(r"-?\d+\.?\d*", text)
-    return float(match[0]) if match else None
-
-
-# =========================
-# 🧠 ГЕНЕРАЦИЯ
-# =========================
-def generate_solution(task):
+@app.post("/api/split")
+async def split_tasks(data: dict):
     try:
+        text = data.get("text", "")
+
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             response_format={"type": "json_object"},
             messages=[{
                 "role": "user",
                 "content": f"""
-Реши задачу и обучай ребенка (4 класс)
+Раздели текст на задачи.
+
+Правила:
+- каждая задача должна быть ПОЛНОЙ
+- не обрезай условия
+- сохраняй номера (например 208, 209)
+
+Текст:
+{text}
+
+Верни JSON:
+{{
+  "tasks": ["..."]
+}}
+"""
+            }]
+        )
+
+        raw = response.choices[0].message.content
+        data = json.loads(raw)
+
+        return {"tasks": data.get("tasks", [])}
+
+    except Exception as e:
+        print("SPLIT ERROR:", e)
+        return {"tasks": ["Ошибка разделения"]}
+
+
+# =========================
+# 🔢 НОРМАЛИЗАЦИЯ ЧИСЕЛ
+# =========================
+def normalize_numbers(text):
+    text = text.lower().replace(",", ".")
+    matches = re.findall(r"-?\d+\.?\d*", text)
+    return [float(x) for x in matches]
+
+
+# =========================
+# 🧠 ГЕНЕРАЦИЯ РЕШЕНИЯ (БЕЗ СЛИВА ОТВЕТОВ)
+# =========================
+def generate_solution(task):
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            response_format={"type": "json_object"},
+            temperature=0.3,
+            messages=[{
+                "role": "user",
+                "content": f"""
+Ты — добрый учитель для 4 класса.
 
 Задача:
 {task}
+
+ВАЖНО:
+- НЕ давай готовый ответ ученику
+- объясняй через вопросы
+- ответ храни отдельно
 
 Верни JSON:
 
@@ -111,11 +164,6 @@ def generate_solution(task):
    }}
  ]
 }}
-
-Правила:
-- сначала реши
-- потом шаги
-- шаги простые
 """
             }]
         )
@@ -124,21 +172,15 @@ def generate_solution(task):
         data = json.loads(raw)
 
         data.setdefault("intro", "Давай разберёмся")
-        data.setdefault("solution", "Нет решения")
+        data.setdefault("solution", "")
         data.setdefault("steps", [])
 
-        # защита шагов
-        if not isinstance(data["steps"], list) or not data["steps"]:
+        if not data["steps"]:
             data["steps"] = [{
                 "question": "С чего начнём?",
                 "answer": "",
-                "hint": "Подумай"
+                "hint": "Подумай внимательно"
             }]
-
-        # защита answer
-        for step in data["steps"]:
-            if not step.get("answer"):
-                step["answer"] = "не задано"
 
         return data
 
@@ -146,7 +188,7 @@ def generate_solution(task):
         print("GEN ERROR:", e)
         return {
             "intro": "Давай попробуем",
-            "solution": "Ошибка",
+            "solution": "",
             "steps": [{
                 "question": "Какое первое действие?",
                 "answer": "",
@@ -156,13 +198,14 @@ def generate_solution(task):
 
 
 # =========================
-# 🧠 AI ПРОВЕРКА
+# 🤖 AI ПРОВЕРКА
 # =========================
 def ai_check(task, step, user, correct):
     try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             response_format={"type": "json_object"},
+            temperature=0.2,
             messages=[{
                 "role": "user",
                 "content": f"""
@@ -177,10 +220,10 @@ def ai_check(task, step, user, correct):
 Правильный ответ:
 {correct}
 
-Ответ:
+Ответ ученика:
 {user}
 
-Верни:
+Верни JSON:
 
 {{
  "status": "correct | almost | wrong",
@@ -192,19 +235,15 @@ def ai_check(task, step, user, correct):
         )
 
         raw = response.choices[0].message.content
-
-        try:
-            return json.loads(raw)
-        except:
-            return {"status": "wrong", "explanation": raw, "hint": "Попробуй ещё"}
+        return json.loads(raw)
 
     except Exception as e:
         print("AI CHECK ERROR:", e)
-        return {"status": "wrong", "explanation": "Ошибка проверки", "hint": "Попробуй ещё"}
+        return {"status": "wrong", "explanation": "Ошибка", "hint": "Попробуй ещё"}
 
 
 # =========================
-# 💬 ЧАТ
+# 💬 ЧАТ (ОБНОВЛЁННЫЙ)
 # =========================
 @app.post("/api/chat/message")
 async def chat(data: dict):
@@ -217,9 +256,6 @@ async def chat(data: dict):
 
         # 🚀 старт
         if session_id not in sessions:
-            if len(message) < 5:
-                return {"reply": "Пустая задача"}
-
             gen = generate_solution(message)
 
             sessions[session_id] = {
@@ -242,25 +278,18 @@ async def chat(data: dict):
         s = sessions[session_id]
         step = s["steps"][s["current_step"]]
 
-        # 🔢 сначала число
-        user_num = normalize_number(message)
-        correct_num = normalize_number(step["answer"])
+        user_nums = normalize_numbers(message)
+        correct_nums = normalize_numbers(step["answer"])
 
-        if user_num is not None and correct_num is not None:
-            if user_num == correct_num:
-                s["current_step"] += 1
-                s["attempts"] = 0
-            else:
-                s["attempts"] += 1
+        correct = False
+
+        if user_nums and correct_nums:
+            correct = user_nums == correct_nums
         else:
-            # 🤖 fallback AI
             result = ai_check(s["task"], step, message, step["answer"])
-            status = result["status"]
-
-            if status == "correct":
-                s["current_step"] += 1
-                s["attempts"] = 0
-            elif status == "almost":
+            if result["status"] == "correct":
+                correct = True
+            elif result["status"] == "almost":
                 return {
                     "reply": f"Почти 👍\n{result['explanation']}",
                     "hint": result["hint"],
@@ -268,17 +297,22 @@ async def chat(data: dict):
                 }
             else:
                 s["attempts"] += 1
-                if s["attempts"] >= 3:
-                    return {
-                        "reply": "Давай подскажу 🙂",
-                        "hint": step["answer"],
-                        "emotion": "thinking"
-                    }
                 return {
                     "reply": f"Не совсем так 🤔\n{result['explanation']}",
                     "hint": result["hint"],
                     "emotion": "confused"
                 }
+
+        if correct:
+            s["current_step"] += 1
+            s["attempts"] = 0
+        else:
+            s["attempts"] += 1
+            return {
+                "reply": "Попробуй ещё 🙂",
+                "hint": step["hint"],
+                "emotion": "confused"
+            }
 
         # 🎉 конец
         if s["current_step"] >= len(s["steps"]):
@@ -301,7 +335,7 @@ async def chat(data: dict):
 
 
 # =========================
-# 📖 РЕШЕНИЕ
+# 📖 РЕШЕНИЕ (СКРЫТОЕ)
 # =========================
 @app.get("/api/solution/{session_id}")
 def solution(session_id: str):
