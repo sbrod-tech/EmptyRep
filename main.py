@@ -31,10 +31,10 @@ def health():
 # =========================
 @app.post("/api/vision")
 async def vision(file: UploadFile = File(...)):
-    image_bytes = await file.read()
-    base64_image = base64.b64encode(image_bytes).decode("utf-8")
-
     try:
+        image_bytes = await file.read()
+        base64_image = base64.b64encode(image_bytes).decode("utf-8")
+
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             response_format={"type": "json_object"},
@@ -44,7 +44,7 @@ async def vision(file: UploadFile = File(...)):
                     "content": [
                         {
                             "type": "text",
-                            "text": "Извлеки ВСЕ математические задачи с изображения. Верни JSON: {\"tasks\": []}"
+                            "text": "Извлеки ВСЕ математические задачи. Верни JSON: {\"tasks\": []}"
                         },
                         {
                             "type": "image_url",
@@ -63,10 +63,18 @@ async def vision(file: UploadFile = File(...)):
         data = json.loads(raw)
         tasks = data.get("tasks", [])
 
-        if not tasks:
+        # 🔥 нормализация
+        clean_tasks = []
+        for t in tasks:
+            if isinstance(t, dict):
+                clean_tasks.append(t.get("task", ""))
+            else:
+                clean_tasks.append(str(t))
+
+        if not clean_tasks:
             return {"tasks": ["Не удалось распознать задачу"]}
 
-        return {"tasks": tasks}
+        return {"tasks": clean_tasks}
 
     except Exception as e:
         print("VISION ERROR:", e)
@@ -97,7 +105,7 @@ def generate_solution(task: str):
   "steps": [
     {{
       "question": "вопрос ученику",
-      "answer": "правильный ответ",
+      "answer": "ответ",
       "hint": "подсказка"
     }}
   ]
@@ -106,7 +114,7 @@ def generate_solution(task: str):
 ВАЖНО:
 - сначала реши задачу
 - затем разбей на шаги
-- шаги должны быть КОНКРЕТНЫМИ
+- шаги должны быть конкретными
 """
             }
         ],
@@ -123,80 +131,85 @@ def generate_solution(task: str):
 # =========================
 @app.post("/api/chat/message")
 async def chat(data: dict):
-    message = data.get("message")
-    session_id = data.get("session_id")
+    try:
+        message = data.get("message")
+        session_id = data.get("session_id")
 
-    if not session_id:
-        return {"reply": "Ошибка: нет session_id"}
+        if not session_id:
+            return {"reply": "Ошибка: нет session_id"}
 
-    # =========================
-    # 🚀 ПЕРВЫЙ ЗАПУСК
-    # =========================
-    if session_id not in sessions:
-        task = message
+        # =========================
+        # 🚀 ПЕРВЫЙ ЗАПУСК
+        # =========================
+        if session_id not in sessions:
+            task = message
 
-        generated = generate_solution(task)
+            generated = generate_solution(task)
 
-        sessions[session_id] = {
-            "task": task,
-            "solution": generated["solution"],
-            "steps": generated["steps"],
-            "intro": generated["intro"],
-            "current_step": 0
-        }
+            sessions[session_id] = {
+                "task": task,
+                "solution": generated["solution"],
+                "steps": generated["steps"],
+                "intro": generated["intro"],
+                "current_step": 0
+            }
 
-        first_step = generated["steps"][0]
+            first_step = generated["steps"][0]
 
-        return {
-            "reply": f"{generated['intro']}\n\n👉 {first_step['question']}",
-            "hint": first_step["hint"],
-            "emotion": "thinking"
-        }
-
-    # =========================
-    # 📚 ПРОДОЛЖЕНИЕ
-    # =========================
-    session = sessions[session_id]
-    steps = session["steps"]
-    i = session["current_step"]
-
-    if i >= len(steps):
-        return {
-            "reply": "🎉 Задача решена! Нажми кнопку, чтобы посмотреть решение.",
-            "emotion": "happy"
-        }
-
-    current = steps[i]
-
-    user_answer = message.strip().lower()
-    correct = current["answer"].strip().lower()
-
-    # =========================
-    # ✅ ПРОВЕРКА ОТВЕТА
-    # =========================
-    if user_answer == correct:
-        session["current_step"] += 1
-
-        if session["current_step"] >= len(steps):
             return {
-                "reply": "🔥 Отлично! Ты решил задачу!",
+                "reply": f"{generated['intro']}\n\n👉 {first_step['question']}",
+                "hint": first_step["hint"],
+                "emotion": "thinking"
+            }
+
+        # =========================
+        # 📚 ПРОДОЛЖЕНИЕ
+        # =========================
+        session = sessions[session_id]
+        steps = session["steps"]
+        i = session["current_step"]
+
+        if i >= len(steps):
+            return {
+                "reply": "🎉 Задача решена! Нажми кнопку, чтобы посмотреть решение.",
                 "emotion": "happy"
             }
 
-        next_step = steps[session["current_step"]]
+        current = steps[i]
 
-        return {
-            "reply": f"Верно 👍\n\n👉 {next_step['question']}",
-            "hint": next_step["hint"],
-            "emotion": "happy"
-        }
+        user_answer = message.strip().lower()
+        correct = current["answer"].strip().lower()
 
-    else:
-        return {
-            "reply": f"Не совсем так 🤔\n\n👉 {current['question']}",
-            "hint": current["hint"],
-            "emotion": "confused"
-        }
+        # =========================
+        # ✅ ПРОВЕРКА
+        # =========================
+        if user_answer == correct:
+            session["current_step"] += 1
+
+            if session["current_step"] >= len(steps):
+                return {
+                    "reply": "🔥 Отлично! Ты решил задачу!",
+                    "emotion": "happy"
+                }
+
+            next_step = steps[session["current_step"]]
+
+            return {
+                "reply": f"Верно 👍\n\n👉 {next_step['question']}",
+                "hint": next_step["hint"],
+                "emotion": "happy"
+            }
+
+        else:
+            return {
+                "reply": f"Не совсем так 🤔\n\n👉 {current['question']}",
+                "hint": current["hint"],
+                "emotion": "confused"
+            }
+
+    except Exception as e:
+        print("CHAT ERROR:", e)
+        return {"reply": "Ошибка сервера 😢"}
 
 
 # =========================
