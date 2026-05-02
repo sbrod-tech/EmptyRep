@@ -7,7 +7,7 @@ import json
 app = FastAPI()
 client = OpenAI()
 
-# 🔥 хранилище сессий
+# 🔥 Хранилище сессий
 sessions = {}
 
 app.add_middleware(
@@ -19,35 +19,58 @@ app.add_middleware(
 )
 
 # =========================
-# 📸 OCR → список задач
+# ❤️ HEALTH
+# =========================
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+# =========================
+# 📸 OCR (VISION)
 # =========================
 @app.post("/api/vision")
 async def vision(file: UploadFile = File(...)):
     image_bytes = await file.read()
     base64_image = base64.b64encode(image_bytes).decode("utf-8")
 
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        response_format={"type": "json_object"},
-        messages=[
-            {
-                "role": "user",
-                "content": f"""
-Извлеки ВСЕ математические задачи с изображения.
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            response_format={"type": "json_object"},
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Извлеки ВСЕ математические задачи с изображения. Верни JSON: {\"tasks\": []}"
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{base64_image}"
+                            }
+                        }
+                    ],
+                }
+            ],
+        )
 
-Верни JSON:
-{{
-  "tasks": ["задача1", "задача2"]
-}}
+        raw = response.choices[0].message.content
+        print("VISION RAW:", raw)
 
-image: data:image/jpeg;base64,{base64_image}
-"""
-            }
-        ],
-    )
+        data = json.loads(raw)
+        tasks = data.get("tasks", [])
 
-    data = json.loads(response.choices[0].message.content)
-    return data
+        if not tasks:
+            return {"tasks": ["Не удалось распознать задачу"]}
+
+        return {"tasks": tasks}
+
+    except Exception as e:
+        print("VISION ERROR:", e)
+        return {"tasks": ["Ошибка распознавания"]}
 
 
 # =========================
@@ -69,12 +92,12 @@ def generate_solution(task: str):
 Верни JSON:
 
 {{
-  "intro": "кратко объясни с чего начать",
+  "intro": "объяснение с чего начать (1-2 предложения)",
   "solution": "полное решение",
   "steps": [
     {{
-      "question": "вопрос",
-      "answer": "ответ",
+      "question": "вопрос ученику",
+      "answer": "правильный ответ",
       "hint": "подсказка"
     }}
   ]
@@ -83,13 +106,16 @@ def generate_solution(task: str):
 ВАЖНО:
 - сначала реши задачу
 - затем разбей на шаги
-- шаги должны быть конкретными
+- шаги должны быть КОНКРЕТНЫМИ
 """
             }
         ],
     )
 
-    return json.loads(response.choices[0].message.content)
+    raw = response.choices[0].message.content
+    print("STEPS RAW:", raw)
+
+    return json.loads(raw)
 
 
 # =========================
@@ -142,12 +168,12 @@ async def chat(data: dict):
 
     current = steps[i]
 
-    # =========================
-    # ✅ ПРОВЕРКА ОТВЕТА
-    # =========================
     user_answer = message.strip().lower()
     correct = current["answer"].strip().lower()
 
+    # =========================
+    # ✅ ПРОВЕРКА ОТВЕТА
+    # =========================
     if user_answer == correct:
         session["current_step"] += 1
 
@@ -192,12 +218,4 @@ def get_solution(session_id: str):
 @app.delete("/api/reset/{session_id}")
 def reset(session_id: str):
     sessions.pop(session_id, None)
-    return {"status": "ok"}
-
-
-# =========================
-# ❤️ HEALTH
-# =========================
-@app.get("/health")
-def health():
     return {"status": "ok"}
