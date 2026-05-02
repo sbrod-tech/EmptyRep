@@ -3,11 +3,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
 import base64
 import json
+import re
 
 app = FastAPI()
 client = OpenAI()
 
-# 🔥 in-memory sessions (для MVP)
 sessions = {}
 
 app.add_middleware(
@@ -27,48 +27,41 @@ def health():
 
 
 # =========================
-# 📸 OCR (VISION)
+# 📸 OCR
 # =========================
 @app.post("/api/vision")
 async def vision(file: UploadFile = File(...)):
     try:
         image_bytes = await file.read()
-        base64_image = base64.b64encode(image_bytes).decode("utf-8")
+        base64_image = base64.b64encode(image_bytes).decode()
 
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             response_format={"type": "json_object"},
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "Извлеки ВСЕ математические задачи. Верни JSON: {\"tasks\": []}"},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
-                    ],
-                }
-            ],
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Верни json {\"tasks\": []} извлеки задачи"},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
+                ]
+            }]
         )
 
         raw = response.choices[0].message.content
-        print("VISION RAW:", raw)
-
         data = json.loads(raw)
+
         tasks = data.get("tasks", [])
 
-        # 🔥 нормализация в List[str]
-        clean_tasks = []
+        clean = []
         for t in tasks:
             if isinstance(t, dict):
-                clean_tasks.append(t.get("task", ""))
+                clean.append(t.get("task", ""))
             else:
-                clean_tasks.append(str(t))
+                clean.append(str(t))
 
-        clean_tasks = [t for t in clean_tasks if t.strip()]
+        clean = [t for t in clean if t.strip()]
 
-        if not clean_tasks:
-            return {"tasks": ["Не удалось распознать задачу"]}
-
-        return {"tasks": clean_tasks}
+        return {"tasks": clean or ["Не удалось распознать задачу"]}
 
     except Exception as e:
         print("VISION ERROR:", e)
@@ -76,18 +69,26 @@ async def vision(file: UploadFile = File(...)):
 
 
 # =========================
-# 🧠 РЕШЕНИЕ + ШАГИ
+# 🔢 НОРМАЛИЗАЦИЯ
 # =========================
-def generate_solution(task: str):
+def normalize_number(text):
+    text = text.lower().replace(",", ".")
+    match = re.findall(r"-?\d+\.?\d*", text)
+    return float(match[0]) if match else None
+
+
+# =========================
+# 🧠 ГЕНЕРАЦИЯ
+# =========================
+def generate_solution(task):
     try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             response_format={"type": "json_object"},
-            messages=[
-                {
-                    "role": "user",
-                    "content": f"""
-Реши задачу и обучай ребёнка (4 класс).
+            messages=[{
+                "role": "user",
+                "content": f"""
+Реши задачу и обучай ребенка (4 класс)
 
 Задача:
 {task}
@@ -95,110 +96,106 @@ def generate_solution(task: str):
 Верни JSON:
 
 {{
-  "intro": "объяснение с чего начать (1-2 предложения)",
-  "solution": "полное решение",
-  "steps": [
-    {{
-      "question": "вопрос ученику",
-      "answer": "правильный ответ",
-      "hint": "подсказка"
-    }}
-  ]
+ "intro": "...",
+ "solution": "...",
+ "steps": [
+   {{
+     "question": "...",
+     "answer": "...",
+     "hint": "..."
+   }}
+ ]
 }}
 
-ВАЖНО:
-- сначала реши задачу
-- затем разбей на шаги
-- не давай сразу ответ ученику
+Правила:
+- сначала реши
+- потом шаги
+- шаги простые
 """
-                }
-            ],
+            }]
         )
 
         raw = response.choices[0].message.content
-        print("STEPS RAW:", raw)
-
         data = json.loads(raw)
 
-        # минимальная защита
-        data.setdefault("intro", "Давай разберёмся с задачей.")
+        data.setdefault("intro", "Давай разберёмся")
         data.setdefault("solution", "Нет решения")
         data.setdefault("steps", [])
 
-        if not data["steps"]:
+        # защита шагов
+        if not isinstance(data["steps"], list) or not data["steps"]:
             data["steps"] = [{
-                "question": "С чего начнём решение?",
+                "question": "С чего начнём?",
                 "answer": "",
-                "hint": "Подумай, какое действие нужно выполнить"
+                "hint": "Подумай"
             }]
+
+        # защита answer
+        for step in data["steps"]:
+            if not step.get("answer"):
+                step["answer"] = "не задано"
 
         return data
 
     except Exception as e:
         print("GEN ERROR:", e)
         return {
-            "intro": "Давай попробуем решить задачу вместе.",
-            "solution": "Ошибка генерации решения",
+            "intro": "Давай попробуем",
+            "solution": "Ошибка",
             "steps": [{
                 "question": "Какое первое действие?",
                 "answer": "",
-                "hint": "Посмотри на задачу внимательно"
+                "hint": "Посмотри внимательно"
             }]
         }
 
 
 # =========================
-# 🧠 AI ПРОВЕРКА ОТВЕТА
+# 🧠 AI ПРОВЕРКА
 # =========================
-def check_answer_with_ai(task, step, user_answer, correct_answer):
+def ai_check(task, step, user, correct):
     try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             response_format={"type": "json_object"},
-            messages=[
-                {
-                    "role": "user",
-                    "content": f"""
-Ты проверяешь ответ ученика (4 класс).
+            messages=[{
+                "role": "user",
+                "content": f"""
+Ты проверяешь ученика.
 
 Задача:
 {task}
 
-Шаг:
+Вопрос:
 {step['question']}
 
 Правильный ответ:
-{correct_answer}
+{correct}
 
-Ответ ученика:
-{user_answer}
+Ответ:
+{user}
 
-Верни JSON:
+Верни:
 
 {{
-  "status": "correct | almost | wrong",
-  "explanation": "коротко объясни",
-  "hint": "подсказка"
+ "status": "correct | almost | wrong",
+ "explanation": "...",
+ "hint": "..."
 }}
-
-Правила:
-- correct → полностью верно
-- almost → небольшая ошибка
-- wrong → ошибка
 """
-                }
-            ],
+            }]
         )
 
-        return json.loads(response.choices[0].message.content)
+        raw = response.choices[0].message.content
+
+        try:
+            return json.loads(raw)
+        except:
+            return {"status": "wrong", "explanation": raw, "hint": "Попробуй ещё"}
 
     except Exception as e:
-        print("CHECK ERROR:", e)
-        return {
-            "status": "wrong",
-            "explanation": "Не удалось проверить ответ",
-            "hint": "Попробуй ещё раз"
-        }
+        print("AI CHECK ERROR:", e)
+        return {"status": "wrong", "explanation": "Ошибка проверки", "hint": "Попробуй ещё"}
 
 
 # =========================
@@ -207,103 +204,103 @@ def check_answer_with_ai(task, step, user_answer, correct_answer):
 @app.post("/api/chat/message")
 async def chat(data: dict):
     try:
-        message = data.get("message", "")
+        message = data.get("message", "").strip()
         session_id = data.get("session_id")
 
         if not session_id:
-            return {"reply": "Ошибка: нет session_id"}
+            return {"reply": "Нет session_id"}
 
-        # 🚀 ПЕРВЫЙ ЗАПУСК
+        # 🚀 старт
         if session_id not in sessions:
-            task = message
-            generated = generate_solution(task)
+            if len(message) < 5:
+                return {"reply": "Пустая задача"}
+
+            gen = generate_solution(message)
 
             sessions[session_id] = {
-                "task": task,
-                "solution": generated["solution"],
-                "steps": generated["steps"],
-                "intro": generated["intro"],
-                "current_step": 0
+                "task": message,
+                "solution": gen["solution"],
+                "steps": gen["steps"],
+                "current_step": 0,
+                "attempts": 0
             }
 
-            first_step = generated["steps"][0]
+            step = gen["steps"][0]
 
             return {
-                "reply": f"{generated['intro']}\n\n👉 {first_step['question']}",
-                "hint": first_step["hint"],
+                "reply": f"{gen['intro']}\n\n👉 {step['question']}",
+                "hint": step["hint"],
                 "emotion": "thinking"
             }
 
-        # 📚 ПРОДОЛЖЕНИЕ
-        session = sessions[session_id]
-        steps = session["steps"]
-        i = session["current_step"]
+        # 📚 продолжение
+        s = sessions[session_id]
+        step = s["steps"][s["current_step"]]
 
-        if i >= len(steps):
-            return {
-                "reply": "🎉 Задача решена! Нажми кнопку, чтобы посмотреть решение.",
-                "emotion": "happy"
-            }
+        # 🔢 сначала число
+        user_num = normalize_number(message)
+        correct_num = normalize_number(step["answer"])
 
-        current = steps[i]
+        if user_num is not None and correct_num is not None:
+            if user_num == correct_num:
+                s["current_step"] += 1
+                s["attempts"] = 0
+            else:
+                s["attempts"] += 1
+        else:
+            # 🤖 fallback AI
+            result = ai_check(s["task"], step, message, step["answer"])
+            status = result["status"]
 
-        # 🧠 AI проверка
-        result = check_answer_with_ai(
-            session["task"],
-            current,
-            message,
-            current["answer"]
-        )
-
-        status = result.get("status", "wrong")
-
-        if status == "correct":
-            session["current_step"] += 1
-
-            if session["current_step"] >= len(steps):
+            if status == "correct":
+                s["current_step"] += 1
+                s["attempts"] = 0
+            elif status == "almost":
                 return {
-                    "reply": "🔥 Отлично! Ты решил задачу!",
-                    "emotion": "happy"
+                    "reply": f"Почти 👍\n{result['explanation']}",
+                    "hint": result["hint"],
+                    "emotion": "thinking"
+                }
+            else:
+                s["attempts"] += 1
+                if s["attempts"] >= 3:
+                    return {
+                        "reply": "Давай подскажу 🙂",
+                        "hint": step["answer"],
+                        "emotion": "thinking"
+                    }
+                return {
+                    "reply": f"Не совсем так 🤔\n{result['explanation']}",
+                    "hint": result["hint"],
+                    "emotion": "confused"
                 }
 
-            next_step = steps[session["current_step"]]
-
+        # 🎉 конец
+        if s["current_step"] >= len(s["steps"]):
             return {
-                "reply": f"Верно 👍\n\n👉 {next_step['question']}",
-                "hint": next_step["hint"],
+                "reply": "🔥 Ты решил задачу!",
                 "emotion": "happy"
             }
 
-        elif status == "almost":
-            return {
-                "reply": f"Почти 👍\n{result['explanation']}",
-                "hint": result["hint"],
-                "emotion": "thinking"
-            }
+        next_step = s["steps"][s["current_step"]]
 
-        else:
-            return {
-                "reply": f"Не совсем так 🤔\n{result['explanation']}",
-                "hint": result["hint"],
-                "emotion": "confused"
-            }
+        return {
+            "reply": f"Верно 👍\n\n👉 {next_step['question']}",
+            "hint": next_step["hint"],
+            "emotion": "happy"
+        }
 
     except Exception as e:
         print("CHAT ERROR:", e)
-        return {"reply": "Ошибка сервера 😢"}
+        return {"reply": "Ошибка сервера"}
 
 
 # =========================
 # 📖 РЕШЕНИЕ
 # =========================
 @app.get("/api/solution/{session_id}")
-def get_solution(session_id: str):
-    session = sessions.get(session_id)
-
-    if not session:
-        return {"solution": "Сессия не найдена"}
-
-    return {"solution": session["solution"]}
+def solution(session_id: str):
+    return {"solution": sessions.get(session_id, {}).get("solution", "Нет")}
 
 
 # =========================
