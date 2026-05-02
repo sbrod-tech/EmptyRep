@@ -8,6 +8,7 @@ import re
 app = FastAPI()
 client = OpenAI()
 
+# ⚠️ пока in-memory (потом заменим на Redis)
 sessions = {}
 
 app.add_middleware(
@@ -19,15 +20,19 @@ app.add_middleware(
 )
 
 # =========================
-# ❤️ HEALTH
+# ❤️ ROOT + HEALTH
 # =========================
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "math tutor backend"}
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
 
 # =========================
-# 📸 OCR (ТЕПЕРЬ БЕЗ РЕЗКИ)
+# 📸 OCR (БЕЗ ОБРЕЗКИ)
 # =========================
 @app.post("/api/vision")
 async def vision(file: UploadFile = File(...)):
@@ -49,7 +54,7 @@ async def vision(file: UploadFile = File(...)):
 Правила:
 - не сокращай
 - не интерпретируй
-- не дели
+- не дели текст
 - сохрани номера задач
 
 Верни строго JSON:
@@ -60,7 +65,9 @@ async def vision(file: UploadFile = File(...)):
                     },
                     {
                         "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{base64_image}"
+                        }
                     }
                 ]
             }]
@@ -69,9 +76,7 @@ async def vision(file: UploadFile = File(...)):
         raw = response.choices[0].message.content
         data = json.loads(raw)
 
-        full_text = data.get("text", "")
-
-        return {"text": full_text or "Не удалось распознать текст"}
+        return {"text": data.get("text", "")}
 
     except Exception as e:
         print("VISION ERROR:", e)
@@ -95,7 +100,7 @@ async def split_tasks(data: dict):
 Раздели текст на задачи.
 
 Правила:
-- каждая задача должна быть ПОЛНОЙ
+- каждая задача должна быть полной
 - не обрезай условия
 - сохраняй номера (например 208, 209)
 
@@ -121,7 +126,7 @@ async def split_tasks(data: dict):
 
 
 # =========================
-# 🔢 НОРМАЛИЗАЦИЯ ЧИСЕЛ
+# 🔢 НОРМАЛИЗАЦИЯ
 # =========================
 def normalize_numbers(text):
     text = text.lower().replace(",", ".")
@@ -130,26 +135,26 @@ def normalize_numbers(text):
 
 
 # =========================
-# 🧠 ГЕНЕРАЦИЯ РЕШЕНИЯ (БЕЗ СЛИВА ОТВЕТОВ)
+# 🧠 ГЕНЕРАЦИЯ РЕШЕНИЯ
 # =========================
 def generate_solution(task):
     try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
-            response_format={"type": "json_object"},
             temperature=0.3,
+            response_format={"type": "json_object"},
             messages=[{
                 "role": "user",
                 "content": f"""
-Ты — добрый учитель для 4 класса.
+Ты — учитель для ученика 4 класса.
 
 Задача:
 {task}
 
 ВАЖНО:
-- НЕ давай готовый ответ ученику
-- объясняй через вопросы
-- ответ храни отдельно
+- не давай прямой ответ
+- веди через вопросы
+- объясняй просто
 
 Верни JSON:
 
@@ -204,8 +209,8 @@ def ai_check(task, step, user, correct):
     try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
-            response_format={"type": "json_object"},
             temperature=0.2,
+            response_format={"type": "json_object"},
             messages=[{
                 "role": "user",
                 "content": f"""
@@ -243,7 +248,7 @@ def ai_check(task, step, user, correct):
 
 
 # =========================
-# 💬 ЧАТ (ОБНОВЛЁННЫЙ)
+# 💬 ЧАТ
 # =========================
 @app.post("/api/chat/message")
 async def chat(data: dict):
@@ -254,8 +259,15 @@ async def chat(data: dict):
         if not session_id:
             return {"reply": "Нет session_id"}
 
-        # 🚀 старт
+        # ⚠️ если сессия потерялась (Render рестарт)
         if session_id not in sessions:
+            return {
+                "reply": "Сессия сбросилась 🙂 Отправь задачу ещё раз",
+                "emotion": "thinking"
+            }
+
+        # 🚀 старт (если прислали новую задачу)
+        if sessions[session_id].get("started") is False:
             gen = generate_solution(message)
 
             sessions[session_id] = {
@@ -263,7 +275,8 @@ async def chat(data: dict):
                 "solution": gen["solution"],
                 "steps": gen["steps"],
                 "current_step": 0,
-                "attempts": 0
+                "attempts": 0,
+                "started": True
             }
 
             step = gen["steps"][0]
@@ -287,6 +300,7 @@ async def chat(data: dict):
             correct = user_nums == correct_nums
         else:
             result = ai_check(s["task"], step, message, step["answer"])
+
             if result["status"] == "correct":
                 correct = True
             elif result["status"] == "almost":
@@ -335,7 +349,7 @@ async def chat(data: dict):
 
 
 # =========================
-# 📖 РЕШЕНИЕ (СКРЫТОЕ)
+# 📖 РЕШЕНИЕ
 # =========================
 @app.get("/api/solution/{session_id}")
 def solution(session_id: str):
