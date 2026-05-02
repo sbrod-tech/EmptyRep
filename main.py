@@ -27,10 +27,8 @@ client = OpenAI()
 class TextRequest(BaseModel):
     text: str
 
-
 class TaskRequest(BaseModel):
     task: str
-
 
 # =========================
 # ❤️ HEALTH
@@ -39,7 +37,6 @@ class TaskRequest(BaseModel):
 def root():
     return {"status": "ok"}
 
-
 # =========================
 # 🧹 CLEAN TEXT
 # =========================
@@ -47,13 +44,13 @@ def clean_text(text: str):
     text = text.replace('\r', '\n')
     text = re.sub(r'\n+', '\n', text)
 
+    # OCR мусор
     text = text.replace('•', ' ')
     text = text.replace('·', ' ')
     text = text.replace('|', ' ')
     text = text.replace('—', '-')
 
     return text.strip()
-
 
 # =========================
 # ✂️ SMART SPLIT
@@ -94,7 +91,6 @@ def split_tasks_smart(text: str):
 
     return tasks
 
-
 # =========================
 # 🔢 АНТИ-ФАНТАЗИЯ
 # =========================
@@ -103,6 +99,20 @@ def contains_new_numbers(task, steps):
     steps_numbers = set(re.findall(r'\d+', json.dumps(steps)))
     return not steps_numbers.issubset(task_numbers)
 
+# =========================
+# ❌ ПЛОХИЕ ШАГИ
+# =========================
+def is_bad_step(step):
+    q = step["question"].lower()
+
+    bad_patterns = [
+        "что такое",
+        "как думаешь",
+        "попробуй подумать",
+        "например"
+    ]
+
+    return any(p in q for p in bad_patterns)
 
 # =========================
 # 🧠 ПРОВЕРКА ЛОГИКИ
@@ -116,7 +126,7 @@ def validate_steps(task: str, steps: list):
                 {
                     "role": "user",
                     "content": f"""
-Ты проверяешь решение задачи для ребёнка.
+Ты проверяешь шаги решения задачи.
 
 ЗАДАЧА:
 {task}
@@ -124,12 +134,12 @@ def validate_steps(task: str, steps: list):
 ШАГИ:
 {json.dumps(steps, ensure_ascii=False)}
 
-ПРОВЕРЬ:
-- логика корректна?
-- шаги связаны с задачей?
-- нет ли угадывания?
+Проверь:
+- логика последовательная?
+- нет ли скачков?
+- каждый шаг — действие?
 
-Ответь:
+Ответ:
 
 {{ "valid": true }}
 или
@@ -145,9 +155,8 @@ def validate_steps(task: str, steps: list):
     except Exception:
         return {"valid": True}
 
-
 # =========================
-# 🧠 ГЕНЕРАЦИЯ ШАГОВ
+# 🧠 ГЕНЕРАЦИЯ ШАГОВ (РЕПЕТИТОР)
 # =========================
 def generate_steps(task: str):
     response = client.chat.completions.create(
@@ -157,16 +166,24 @@ def generate_steps(task: str):
             {
                 "role": "user",
                 "content": f"""
-Ты помощник по математике для детей 1–5 класса.
+Ты лучший репетитор по математике для детей 1–5 класса.
 
-❗ ПРАВИЛА:
-- Используй только данные задачи
-- НЕ придумывай числа
-- НЕ меняй условия
-- НЕ давай ответ сразу
-- каждый шаг простой
+=========================
+ПРАВИЛА
+=========================
 
-Верни JSON:
+1. Каждый шаг = КОНКРЕТНОЕ действие
+2. Вопрос = простой и понятный
+3. НЕЛЬЗЯ:
+   - "что такое..."
+   - "как думаешь"
+   - "например"
+4. НЕ менять числа
+5. НЕ придумывать данные
+
+=========================
+ФОРМАТ
+=========================
 
 {{
   "steps": [
@@ -178,7 +195,10 @@ def generate_steps(task: str):
   ]
 }}
 
-Задача:
+=========================
+ЗАДАЧА
+=========================
+
 {task}
 """
             }
@@ -187,7 +207,6 @@ def generate_steps(task: str):
 
     raw = response.choices[0].message.content
     return json.loads(raw)
-
 
 # =========================
 # 📸 OCR
@@ -204,11 +223,16 @@ async def vision(file: UploadFile = File(...)):
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": "Распознай текст полностью, сохрани строки"},
+                        {
+                            "type": "text",
+                            "text": "Распознай текст полностью, сохрани строки"
+                        },
                         {
                             "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
-                        }
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{base64_image}"
+                            },
+                        },
                     ],
                 }
             ],
@@ -219,7 +243,6 @@ async def vision(file: UploadFile = File(...)):
 
     except Exception:
         return {"text": ""}
-
 
 # =========================
 # ✂️ SPLIT API
@@ -233,26 +256,32 @@ async def split(req: TextRequest):
     except Exception:
         return {"tasks": [req.text]}
 
-
 # =========================
 # 🚀 GENERATE API
 # =========================
 @app.post("/api/generate")
 async def generate(req: TaskRequest):
     try:
-        # 1. генерация
         data = generate_steps(req.task)
 
-        # 2. проверка чисел
+        # защита от новых чисел
         if contains_new_numbers(req.task, data):
-            data = generate_steps(req.task + "\n\nНЕ ДОБАВЛЯЙ НОВЫЕ ЧИСЛА")
+            data = generate_steps(
+                req.task + "\n\nНЕ ДОБАВЛЯЙ НОВЫЕ ЧИСЛА"
+            )
 
-        # 3. проверка логики
-        validation = validate_steps(req.task, data)
+        # защита от плохих вопросов
+        if any(is_bad_step(s) for s in data["steps"]):
+            data = generate_steps(
+                req.task + "\n\nНЕ задавай абстрактные вопросы"
+            )
+
+        # проверка логики
+        validation = validate_steps(req.task, data["steps"])
 
         if not validation.get("valid", True):
             data = generate_steps(
-                req.task + "\n\nИсправь логику. Шаги должны быть последовательными"
+                req.task + "\n\nИсправь логику шагов"
             )
 
         return data
