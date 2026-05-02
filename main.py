@@ -29,12 +29,18 @@ class TextRequest(BaseModel):
 class TaskRequest(BaseModel):
     task: str
 
+class CheckAnswerRequest(BaseModel):
+    user_answer: str
+    correct_answer: str
+
+
 # =========================
 # ❤️ HEALTH
 # =========================
 @app.get("/")
 def root():
     return {"status": "ok"}
+
 
 # =========================
 # 🧹 CLEAN TEXT
@@ -47,6 +53,7 @@ def clean_text(text: str):
     text = text.replace('|', ' ')
     text = text.replace('—', '-')
     return text.strip()
+
 
 # =========================
 # ✂️ SMART SPLIT
@@ -84,11 +91,13 @@ def split_tasks_smart(text: str):
 
     return tasks
 
+
 # =========================
 # 🔢 SIMPLE MATH
 # =========================
 def is_simple_expression(task: str):
     return bool(re.match(r'^[\d\s\+\-\*/\(\)]+$', task.strip()))
+
 
 def generate_simple_steps(task: str):
     task = task.replace(" ", "")
@@ -105,11 +114,36 @@ def generate_simple_steps(task: str):
 
             return {
                 "steps": [
-                    {"question": f"Разложим {a}. Сколько это?", "answer": f"{a10}+{a1}", "hint": "Десятки и единицы"},
-                    {"question": f"Разложим {b}. Сколько это?", "answer": f"{b10}+{b1}", "hint": "То же самое"},
-                    {"question": f"{a10} + {b10} = ?", "answer": str(sum10), "hint": "Складываем десятки"},
-                    {"question": f"{a1} + {b1} = ?", "answer": str(sum1), "hint": "Складываем единицы"},
-                    {"question": f"{sum10} + {sum1} = ?", "answer": str(result), "hint": "Финал"}
+                    {
+                        "action": f"{a10}+{a1}",
+                        "question": f"Разложим {a}. Сколько это?",
+                        "answer": f"{a10}+{a1}",
+                        "hint": "Десятки и единицы"
+                    },
+                    {
+                        "action": f"{b10}+{b1}",
+                        "question": f"Разложим {b}. Сколько это?",
+                        "answer": f"{b10}+{b1}",
+                        "hint": "То же самое"
+                    },
+                    {
+                        "action": f"{a10}+{b10}",
+                        "question": f"{a10} + {b10} = ?",
+                        "answer": str(sum10),
+                        "hint": "Складываем десятки"
+                    },
+                    {
+                        "action": f"{a1}+{b1}",
+                        "question": f"{a1} + {b1} = ?",
+                        "answer": str(sum1),
+                        "hint": "Складываем единицы"
+                    },
+                    {
+                        "action": f"{sum10}+{sum1}",
+                        "question": f"{sum10} + {sum1} = ?",
+                        "answer": str(result),
+                        "hint": "Финал"
+                    }
                 ]
             }
         except:
@@ -119,11 +153,17 @@ def generate_simple_steps(task: str):
         result = eval(task)
         return {
             "steps": [
-                {"question": f"Сколько будет {task}?", "answer": str(result), "hint": ""}
+                {
+                    "action": task,
+                    "question": f"Сколько будет {task}?",
+                    "answer": str(result),
+                    "hint": ""
+                }
             ]
         }
     except:
         return {"steps": []}
+
 
 # =========================
 # 🧠 SOLVE FIRST
@@ -135,20 +175,21 @@ def solve_task(task: str):
         messages=[{
             "role": "user",
             "content": f"""
-Реши задачу.
+Реши задачу полностью.
 
 Задача:
 {task}
 
-Верни JSON:
+Верни:
 {{"final_answer":"...","plan":["шаг1","шаг2"]}}
 """
         }]
     )
     return json.loads(res.choices[0].message.content)
 
+
 # =========================
-# 🧠 GENERATE STEPS
+# 🧠 GENERATE STEPS (КЛЮЧЕВОЙ БЛОК)
 # =========================
 def generate_steps(task: str, solution: dict):
     res = client.chat.completions.create(
@@ -157,26 +198,42 @@ def generate_steps(task: str, solution: dict):
         messages=[{
             "role": "user",
             "content": f"""
-Ты репетитор.
+Ты репетитор 4 класса.
+
+ЗАДАЧА:
+{task}
+
+ОТВЕТ:
+{solution.get("final_answer")}
 
 ПЛАН:
 {solution.get("plan", [])}
 
-Сделай пошаговое обучение.
+Сделай шаги обучения.
 
-Правила:
-- не менять числа
-- без фантазии
-- короткие вопросы
+ВАЖНО:
+- каждый шаг = вычисление
+- не пересказывать задачу
+- не задавать "что известно"
+- только реальные действия
 
-Верни JSON steps.
-
-Задача:
-{task}
+Формат:
+{{
+ "steps":[
+  {{
+   "action":"176+234",
+   "question":"Сколько будет 176 + 234?",
+   "answer":"410",
+   "hint":"Это сколько на второй машине"
+  }}
+ ]
+}}
 """
         }]
     )
+
     return json.loads(res.choices[0].message.content)
+
 
 # =========================
 # 🔒 VALIDATION
@@ -186,9 +243,16 @@ def contains_new_numbers(task, steps):
     step_nums = set(re.findall(r'\d+', json.dumps(steps)))
     return not step_nums.issubset(task_nums)
 
+
 def is_bad_step(step):
-    bad = ["что такое", "как думаешь", "например"]
+    bad = [
+        "что известно",
+        "сколько на первой",
+        "что нужно найти",
+        "как думаешь"
+    ]
     return any(b in step["question"].lower() for b in bad)
+
 
 # =========================
 # 📸 OCR
@@ -203,13 +267,14 @@ async def vision(file: UploadFile = File(...)):
         messages=[{
             "role": "user",
             "content": [
-                {"type": "text", "text": "Распознай текст полностью"},
+                {"type": "text", "text": "Распознай текст"},
                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
             ]
         }]
     )
 
     return {"text": res.choices[0].message.content}
+
 
 # =========================
 # ✂️ SPLIT
@@ -219,6 +284,7 @@ async def split(req: TextRequest):
     text = clean_text(req.text)
     return {"tasks": split_tasks_smart(text)}
 
+
 # =========================
 # 🚀 GENERATE
 # =========================
@@ -227,19 +293,14 @@ async def generate(req: TaskRequest):
     task = req.task.strip()
 
     try:
-        # 1. simple math
         if is_simple_expression(task):
             simple = generate_simple_steps(task)
             if simple["steps"]:
                 return simple
 
-        # 2. solve
         solution = solve_task(task)
-
-        # 3. generate steps
         data = generate_steps(task, solution)
 
-        # 4. validate
         for _ in range(2):
             if contains_new_numbers(task, data):
                 data = generate_steps(task, solution)
@@ -253,7 +314,7 @@ async def generate(req: TaskRequest):
 
         return data
 
-    except Exception as e:
+    except Exception:
         return {
             "steps": [
                 {
@@ -263,14 +324,11 @@ async def generate(req: TaskRequest):
                 }
             ]
         }
-    # =========================
+
+
+# =========================
 # ✅ CHECK ANSWER
 # =========================
-class CheckAnswerRequest(BaseModel):
-    user_answer: str
-    correct_answer: str
-
-
 def normalize_answer(text: str):
     text = text.lower().strip()
     text = re.sub(r'[^0-9\.\-]', '', text)
@@ -286,29 +344,7 @@ async def check_answer(req: CheckAnswerRequest):
         if user == correct:
             return {"correct": True}
 
-        # fallback через GPT
-        res = client.chat.completions.create(
-            model="gpt-4o-mini",
-            response_format={"type": "json_object"},
-            messages=[{
-                "role": "user",
-                "content": f"""
-Проверь равны ли ответы.
+        return {"correct": False}
 
-Ответ ученика: {req.user_answer}
-Правильный ответ: {req.correct_answer}
-
-Игнорируй единицы измерения.
-
-Верни:
-{{"correct": true/false}}
-"""
-            }]
-        )
-
-        data = json.loads(res.choices[0].message.content)
-
-        return {"correct": data.get("correct", False)}
-
-    except Exception:
+    except:
         return {"correct": False}
