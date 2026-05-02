@@ -3,14 +3,14 @@ import json
 import base64
 import re
 
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
 
 # ================= INIT =================
 
-app = FastAPI(title="Murmatika Vision API 🐾")
+app = FastAPI(title="Murmatika API 🐾")
 
 app.add_middleware(
     CORSMiddleware,
@@ -61,6 +61,38 @@ def build_addition_steps(text):
         {"q": f"Сколько будет {a} + {b}?", "a": a + b}
     ]
 
+# ================= FULL SOLUTION =================
+
+def generate_full_solution(problem: str):
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            response_format={"type": "json_object"},
+            messages=[
+                {
+                    "role": "system",
+                    "content": """
+Ты учитель начальных классов.
+
+Реши задачу полностью и понятно для ребёнка.
+
+Верни JSON:
+{
+  "solution": "пошаговое решение простым языком",
+  "answer": 26
+}
+"""
+                },
+                {"role": "user", "content": problem}
+            ]
+        )
+
+        data = json.loads(response.choices[0].message.content)
+        return data.get("solution", "Нет решения")
+
+    except Exception as e:
+        return f"Ошибка решения: {str(e)}"
+
 # ================= VISION =================
 
 @app.post("/api/vision")
@@ -68,7 +100,6 @@ async def vision_ocr(file: UploadFile = File(...)):
     try:
         contents = await file.read()
 
-        # защита от огромных файлов
         if len(contents) > 5_000_000:
             return {"tasks": ["Фото слишком большое 📷"]}
 
@@ -83,27 +114,23 @@ async def vision_ocr(file: UploadFile = File(...)):
                     "content": """
 Ты анализируешь фото страницы учебника (1–5 класс).
 
-Твоя задача:
-- Найти ВСЕ задачи на странице
+Нужно:
+- Найти все задачи
 - Разделить их
-- Исправить ошибки распознавания
-- НЕ решать задачи
+- Исправить ошибки
 
-Верни строго JSON:
+НЕ решай задачи
 
+Верни JSON:
 {
-  "tasks": [
-    "9 + 17",
-    "5 + 4",
-    "Ваня шел 12 минут..."
-  ]
+  "tasks": ["..."]
 }
 """
                 },
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": "Найди задачи на изображении"},
+                        {"type": "text", "text": "Найди задачи"},
                         {
                             "type": "image_url",
                             "image_url": {
@@ -117,15 +144,10 @@ async def vision_ocr(file: UploadFile = File(...)):
 
         data = json.loads(response.choices[0].message.content)
 
-        return {
-            "tasks": data.get("tasks", [])
-        }
+        return {"tasks": data.get("tasks", [])}
 
     except Exception as e:
-        return {
-            "tasks": [],
-            "error": str(e)
-        }
+        return {"tasks": [], "error": str(e)}
 
 # ================= CHAT =================
 
@@ -139,17 +161,15 @@ def chat(data: ChatMessageRequest):
 
         if is_simple_addition(text):
             steps = build_addition_steps(text)
+            solution = f"{text} = {steps[-1]['a']}"
         else:
-            return {
-                "reply": "Я пока помогаю с простыми примерами 😊",
-                "question": "",
-                "hint": "",
-                "emotion": "thinking"
-            }
+            steps = [{"q": "Пока решаем простые примеры 😊", "a": 0}]
+            solution = generate_full_solution(text)
 
         state_memory[user_id] = {
             "steps": steps,
-            "step": 0
+            "step": 0,
+            "solution": solution
         }
 
         return {
@@ -172,7 +192,6 @@ def chat(data: ChatMessageRequest):
             "emotion": "thinking"
         }
 
-    # --- правильно ---
     if user_num == step["a"]:
         state["step"] += 1
 
@@ -195,7 +214,6 @@ def chat(data: ChatMessageRequest):
             "emotion": "happy"
         }
 
-    # --- ошибка ---
     return {
         "reply": "Попробуй ещё 🐾",
         "question": step["q"],
@@ -206,10 +224,13 @@ def chat(data: ChatMessageRequest):
 # ================= SOLUTION =================
 
 @app.get("/api/solution")
-def solution():
-    return {
-        "solution": "Скоро будет подробное решение 🐾"
-    }
+def solution(user_id: str = Query(...)):
+    state = state_memory.get(user_id)
+
+    if not state:
+        return {"solution": "Сначала выбери задачу 😊"}
+
+    return {"solution": state.get("solution", "Нет решения")}
 
 # ================= HEALTH =================
 
